@@ -1,0 +1,43 @@
+# =========================
+# Speech Enhancement Config
+# =========================
+
+# --- Data ---
+data:
+  train_csv: "data/train.csv"
+  val_csv: "data/val.csv"
+  test_csv: "data/test.csv"     # optional, để trống hoặc xóa key nếu không có
+  sample_rate: 16000
+  segment_seconds: 4.0          # độ dài đoạn audio cắt ra để train (giây)
+
+# --- STFT ---
+stft:
+  n_fft: 512
+  hop_length: 128
+  win_length: 512
+
+# --- Model ---
+model:
+  name: "CRN"                   # tên class trong src/model.py
+  base_channels: 16
+  rnn_hidden: 128
+  rnn_layers: 2
+
+# --- Training ---
+train:
+  batch_size: 8
+  num_workers: 4
+  epochs: 100
+  lr: 0.0003
+  weight_decay: 0.0
+  grad_clip: 5.0
+  loss: "sisnr"                 # "sisnr" | "spectral" | "combo"
+  early_stop_patience: 15
+  device: "cuda"                # "cuda" | "cpu" | "auto"
+  seed: 42
+  log_dir: "runs"
+  checkpoint_dir: "checkpoints"
+
+# --- Inference ---
+infer:
+  device: "auto"

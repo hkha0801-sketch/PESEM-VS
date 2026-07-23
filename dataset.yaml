@@ -1,0 +1,10 @@
+dataset_name: PESEM-VS
+
+huggingface:
+  repo_id: KhaBui/PESEM-VS
+  repo_type: dataset
+
+folders:
+  clean: "CLEAN"
+  noise: "NOISE"
+  noise_speech: "NOISE SPEECH"

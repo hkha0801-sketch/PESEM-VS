@@ -1,58 +1,97 @@
+import os
+import librosa
 import numpy as np
-import torch
 
-try:
-    from pesq import pesq as pesq_fn
-except ImportError:
-    pesq_fn = None
+from pesq import pesq
+from pystoi import stoi
 
-try:
-    from pystoi import stoi as stoi_fn
-except ImportError:
-    stoi_fn = None
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def compute_si_sdr(est: np.ndarray, ref: np.ndarray, eps: float = 1e-8) -> float:
-    est = est - np.mean(est)
-    ref = ref - np.mean(ref)
-    s_target = np.sum(est * ref) * ref / (np.sum(ref ** 2) + eps)
-    e_noise = est - s_target
-    return 10 * np.log10((np.sum(s_target ** 2) + eps) / (np.sum(e_noise ** 2) + eps))
+CLEAN_DIR = os.path.join(ROOT_DIR, "input")
+ENHANCED_DIR = os.path.join(ROOT_DIR, "output", "enhanced")
+RESULT_FILE = os.path.join(ROOT_DIR, "metrics_result.txt")
 
+SAMPLE_RATE = 16000
 
-def compute_pesq(est: np.ndarray, ref: np.ndarray, sr: int = 16000) -> float:
-    if pesq_fn is None:
-        raise ImportError("pip install pesq")
-    mode = "wb" if sr == 16000 else "nb"
+pesq_scores = []
+stoi_scores = []
+
+result_lines = []
+
+header = f"{'File':35s} {'PESQ':>8} {'STOI':>8}"
+print(header)
+print("-" * len(header))
+
+result_lines.append(header)
+result_lines.append("-" * len(header))
+
+for file in sorted(os.listdir(CLEAN_DIR)):
+
+    if not file.endswith(".wav"):
+        continue
+
+    clean_path = os.path.join(CLEAN_DIR, file)
+    enhanced_path = os.path.join(ENHANCED_DIR, file)
+
+    if not os.path.exists(enhanced_path):
+        continue
+
     try:
-        return pesq_fn(sr, ref, est, mode)
-    except Exception as e:
-        print(f"[WARN] PESQ failed: {e}")
-        return float("nan")
+
+        clean, _ = librosa.load(clean_path, sr=SAMPLE_RATE)
+        enhanced, _ = librosa.load(enhanced_path, sr=SAMPLE_RATE)
+
+        length = min(len(clean), len(enhanced))
+        clean = clean[:length]
+        enhanced = enhanced[:length]
+
+        pesq_score = pesq(
+            SAMPLE_RATE,
+            clean,
+            enhanced,
+            "wb"
+        )
+
+        stoi_score = stoi(
+            clean,
+            enhanced,
+            SAMPLE_RATE,
+            extended=False
+        )
+
+        pesq_scores.append(pesq_score)
+        stoi_scores.append(stoi_score)
+
+        line = f"{file:35s} {pesq_score:8.3f} {stoi_score:8.3f}"
+
+        print(line)
+        result_lines.append(line)
+
+    except:
+        continue
 
 
-def compute_stoi(est: np.ndarray, ref: np.ndarray, sr: int = 16000) -> float:
-    if stoi_fn is None:
-        raise ImportError("pip install pystoi")
-    return stoi_fn(ref, est, sr, extended=False)
+print("-" * len(header))
+result_lines.append("-" * len(header))
+
+if len(pesq_scores) > 0:
+
+    avg_pesq = np.mean(pesq_scores)
+    avg_stoi = np.mean(stoi_scores)
+
+    avg_line = f"{'Average':35s} {avg_pesq:8.3f} {avg_stoi:8.3f}"
+
+    print(avg_line)
+    result_lines.append(avg_line)
+
+else:
+
+    print("No valid audio pairs found.")
+    result_lines.append("No valid audio pairs found.")
 
 
-def evaluate_batch(est: torch.Tensor, ref: torch.Tensor, sr: int = 16000) -> dict:
-    """est, ref: (B, T) tensors on CPU. Trả về dict metric trung bình trên batch."""
-    est_np = est.detach().cpu().numpy()
-    ref_np = ref.detach().cpu().numpy()
+with open(RESULT_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(result_lines))
 
-    si_sdrs, pesqs, stois = [], [], []
-    for e, r in zip(est_np, ref_np):
-        si_sdrs.append(compute_si_sdr(e, r))
-        if pesq_fn is not None:
-            pesqs.append(compute_pesq(e, r, sr))
-        if stoi_fn is not None:
-            stois.append(compute_stoi(e, r, sr))
-
-    result = {"si_sdr": float(np.mean(si_sdrs))}
-    if pesqs:
-        result["pesq"] = float(np.nanmean(pesqs))
-    if stois:
-        result["stoi"] = float(np.mean(stois))
-    return result
+print(f"\nResults saved to: {RESULT_FILE}")

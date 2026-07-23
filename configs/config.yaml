@@ -1,43 +1,97 @@
-# =========================
-# Speech Enhancement Config
-# =========================
-
-# --- Data ---
+# ==========================================
+# DATA
+# ==========================================
 data:
   train_csv: "data/train.csv"
   val_csv: "data/val.csv"
-  test_csv: "data/test.csv"     # optional, để trống hoặc xóa key nếu không có
+  test_csv: "data/test.csv"
   sample_rate: 16000
-  segment_seconds: 4.0          # độ dài đoạn audio cắt ra để train (giây)
+  segment_seconds: 4.0
 
-# --- STFT ---
+
+# ==========================================
+# STFT
+# ==========================================
 stft:
   n_fft: 512
   hop_length: 128
   win_length: 512
 
-# --- Model ---
-model:
-  name: "CRN"                   # tên class trong src/model.py
-  base_channels: 16
-  rnn_hidden: 128
-  rnn_layers: 2
 
-# --- Training ---
+# ==========================================
+# MODEL - FullSubNet
+# ==========================================
+model:
+  name: "FullSubNet"
+
+  # Frequency bins
+  num_freqs: 257
+
+  # Look ahead
+  look_ahead: 2
+
+  # Sequence model
+  sequence_model: "LSTM"
+
+  # Frequency neighbors
+  fb_num_neighbors: 0
+  sb_num_neighbors: 15
+
+  # Output activation
+  fb_output_activate_function: null
+  sb_output_activate_function: null
+
+  # Hidden size
+  fb_model_hidden_size: 512
+  sb_model_hidden_size: 384
+
+  # Normalization
+  norm_type: "offline_laplace_norm"
+
+  # Drop band
+  num_groups_in_drop_band: 2
+
+  # Không khởi tạo weight mới khi inference
+  weight_init: false
+
+
+# ==========================================
+# TRAINING
+# ==========================================
 train:
   batch_size: 8
   num_workers: 4
   epochs: 100
+
   lr: 0.0003
   weight_decay: 0.0
+
   grad_clip: 5.0
-  loss: "sisnr"                 # "sisnr" | "spectral" | "combo"
+
+  loss: "sisnr"
+
   early_stop_patience: 15
-  device: "cuda"                # "cuda" | "cpu" | "auto"
+
+  device: "auto"
+
   seed: 42
+
   log_dir: "runs"
   checkpoint_dir: "checkpoints"
 
-# --- Inference ---
+
+# ==========================================
+# INFERENCE
+# ==========================================
 infer:
   device: "auto"
+
+  checkpoint: "checkpoints/best_model_FullSubNet_EN.tar"
+
+  # Nếu chạy 1 file
+  input: null
+  output: null
+
+  # Nếu chạy cả folder
+  input_dir: "input"
+  output_dir: "output/enhanced"

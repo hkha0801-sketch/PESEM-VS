@@ -67,9 +67,13 @@ def save_checkpoint(path: str, model, optimizer, epoch: int, best_val: float, cf
     )
 
 
-def load_checkpoint(path: str, model, optimizer=None, map_location="cpu"):
-    ckpt = torch.load(path, map_location=map_location)
-    model.load_state_dict(ckpt["model_state"])
-    if optimizer is not None and ckpt.get("optimizer_state") is not None:
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-    return ckpt.get("epoch", 0), ckpt.get("best_val", float("inf"))
+def load_checkpoint(checkpoint_path, model, map_location="cpu"):
+    ckpt = torch.load(
+        checkpoint_path,
+        map_location=map_location,
+        weights_only=False
+    )
+
+    model.load_state_dict(ckpt["model"])
+
+    return ckpt

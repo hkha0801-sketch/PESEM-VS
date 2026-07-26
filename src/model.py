@@ -282,6 +282,38 @@ def decompress_cIRM(x, K=10):
 
 
 # ============================================================
+# SHARED WEIGHT INIT
+# ============================================================
+
+def generic_weight_init(module_root):
+    """
+    Weight init dùng chung cho FullSubNet và InterSubNet.
+
+    Chỉ nên gọi khi KHÔNG load checkpoint (train from scratch),
+    vì gọi sau khi load_state_dict sẽ ghi đè trọng số đã học.
+    """
+
+    for module in module_root.modules():
+
+        if isinstance(module, nn.Linear):
+
+            nn.init.xavier_uniform_(module.weight)
+
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        elif isinstance(module, (nn.LSTM, nn.GRU)):
+
+            for name, param in module.named_parameters():
+
+                if "weight" in name:
+                    nn.init.xavier_uniform_(param)
+
+                elif "bias" in name:
+                    nn.init.zeros_(param)
+
+
+# ============================================================
 # FULLSUBNET CORE
 # ============================================================
 
@@ -383,44 +415,7 @@ class FullSubNetCore(nn.Module):
             self._weight_init()
 
     def _weight_init(self):
-
-        for module in self.modules():
-
-            if isinstance(
-                module,
-                nn.Linear,
-            ):
-
-                nn.init.xavier_uniform_(
-                    module.weight
-                )
-
-                if module.bias is not None:
-                    nn.init.zeros_(
-                        module.bias
-                    )
-
-            elif isinstance(
-                module,
-                (
-                    nn.LSTM,
-                    nn.GRU,
-                ),
-            ):
-
-                for name, param in module.named_parameters():
-
-                    if "weight" in name:
-
-                        nn.init.xavier_uniform_(
-                            param
-                        )
-
-                    elif "bias" in name:
-
-                        nn.init.zeros_(
-                            param
-                        )
+        generic_weight_init(self)
 
     def forward(
         self,
@@ -702,6 +697,425 @@ class FullSubNetWrapper(
 
         noisy_real = spec.real
 
+        noisy_imag = spec.imag
+
+        # ====================================================
+        # COMPLEX MULTIPLICATION
+        # ====================================================
+
+        enhanced_real = (
+            noisy_real * mask_real
+            - noisy_imag * mask_imag
+        )
+
+        enhanced_imag = (
+            noisy_real * mask_imag
+            + noisy_imag * mask_real
+        )
+
+        enhanced_spec = torch.complex(
+            enhanced_real,
+            enhanced_imag,
+        )
+
+        # ====================================================
+        # ISTFT
+        # ====================================================
+
+        enhanced_wav = istft(
+            enhanced_spec,
+            self.n_fft,
+            self.hop_length,
+            self.win_length,
+            length=length,
+        )
+
+        return enhanced_wav
+
+
+
+class SubbandInteraction(nn.Module):
+    """
+    Module SubInter: kết hợp thông tin cục bộ (local, theo từng
+    subband) với thông tin toàn cục (global, trung bình theo tần số).
+
+    Input / Output: (B, F, T, C) với C = input_size (không đổi).
+    """
+
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+
+        self.input_linear = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.PReLU(),
+        )
+
+        self.mean_linear = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.PReLU(),
+        )
+
+        self.output_linear = nn.Sequential(
+            nn.Linear(hidden_size * 2, input_size),
+            nn.PReLU(),
+        )
+
+        self.norm = nn.LayerNorm(input_size)
+
+    def forward(self, x):
+        # x: (B, F, T, C)
+
+        h_local = self.input_linear(x)
+        # (B, F, T, H)
+
+        h_mean = h_local.mean(dim=1, keepdim=True)
+        # (B, 1, T, H) - thông tin toàn cục theo trục tần số
+
+        h_global = self.mean_linear(h_mean)
+        # (B, 1, T, H)
+
+        h_global = h_global.expand(-1, h_local.shape[1], -1, -1)
+        # (B, F, T, H)
+
+        combined = torch.cat([h_local, h_global], dim=-1)
+        # (B, F, T, 2H)
+
+        out = self.output_linear(combined)
+        # (B, F, T, C)
+
+        # Residual + norm
+        return self.norm(x + out)
+
+
+class SubInterLSTMBlock(nn.Module):
+    """
+    Một "SIL block" (SubInter-LSTM block): SubInter -> RNN -> norm.
+
+    RNN chạy độc lập theo thời gian cho từng (batch, frequency),
+    nhưng chia sẻ trọng số giữa các tần số, nên cần gộp (B, F)
+    thành một chiều batch duy nhất khi đưa vào RNN.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        subinter_hidden_size,
+        rnn_hidden_size,
+        sequence_model="LSTM",
+    ):
+        super().__init__()
+
+        assert sequence_model in ("LSTM", "GRU")
+
+        self.SubInter = SubbandInteraction(
+            input_size,
+            subinter_hidden_size,
+        )
+
+        if sequence_model == "LSTM":
+            self.RNN = nn.LSTM(
+                input_size,
+                rnn_hidden_size,
+                num_layers=1,
+                batch_first=True,
+            )
+        else:
+            self.RNN = nn.GRU(
+                input_size,
+                rnn_hidden_size,
+                num_layers=1,
+                batch_first=True,
+            )
+
+        self.norm = nn.LayerNorm(rnn_hidden_size)
+
+    def forward(self, x):
+        # x: (B, F, T, C)
+
+        b, f, t, c = x.shape
+
+        x = self.SubInter(x)
+
+        x = x.reshape(b * f, t, c)
+
+        x, _ = self.RNN(x)
+
+        x = self.norm(x)
+
+        x = x.reshape(b, f, t, -1)
+
+        return x
+
+
+class InterSubbandModel(nn.Module):
+    """
+    Toàn bộ "Gis" trong bài báo Inter-SubNet: nhiều SIL block
+    xếp chồng, theo sau là một fully-connected layer để ra cIRM.
+
+    Checkpoint hiện tại có đúng 2 SIL block với hidden size
+    lần lượt là 93 và 307 (khớp tinh thần bài báo, tuy giá trị
+    cụ thể phụ thuộc vào cấu hình huấn luyện).
+    """
+
+    def __init__(
+        self,
+        sb_num_neighbors,
+        sil_hidden_sizes=(93, 307),
+        rnn_hidden_size=384,
+        output_size=2,
+        sequence_model="LSTM",
+    ):
+        super().__init__()
+
+        input_size = sb_num_neighbors * 2 + 1
+
+        blocks = []
+        in_size = input_size
+
+        for hidden_size in sil_hidden_sizes:
+
+            blocks.append(
+                SubInterLSTMBlock(
+                    in_size,
+                    hidden_size,
+                    rnn_hidden_size,
+                    sequence_model=sequence_model,
+                )
+            )
+
+            in_size = rnn_hidden_size
+
+        self.sequence_list = nn.ModuleList(blocks)
+
+        self.fc_output_layer = nn.Linear(
+            rnn_hidden_size,
+            output_size,
+        )
+
+    def forward(self, x):
+        # x: (B, F, T, C_in)
+
+        for block in self.sequence_list:
+            x = block(x)
+
+        x = self.fc_output_layer(x)
+        # (B, F, T, output_size)
+
+        return x
+
+
+# ============================================================
+# INTERSUBNET CORE
+# ============================================================
+
+class InterSubNetCore(nn.Module):
+    """
+    InterSubNet không có nhánh full-band (fb_model) như FullSubNet.
+    Toàn bộ mô hình chỉ có một sub-band model (self.sb_model),
+    nhận trực tiếp noisy magnitude đã unfold theo tần số.
+    """
+
+    def __init__(
+        self,
+        num_freqs,
+        look_ahead,
+        sequence_model,
+        sb_num_neighbors,
+        sb_output_activate_function,
+        sb_model_hidden_size,
+        sil_hidden_sizes=(93, 307),
+        norm_type="offline_laplace_norm",
+        num_groups_in_drop_band=2,
+        weight_init=True,
+    ):
+        super().__init__()
+
+        assert sequence_model in ("GRU", "LSTM")
+
+        self.num_freqs = num_freqs
+
+        self.look_ahead = look_ahead
+
+        self.sb_num_neighbors = sb_num_neighbors
+
+        self.num_groups_in_drop_band = num_groups_in_drop_band
+
+        # ====================================================
+        # SUB-BAND MODEL (với subband interaction)
+        # ====================================================
+
+        self.sb_model = InterSubbandModel(
+            sb_num_neighbors=sb_num_neighbors,
+            sil_hidden_sizes=sil_hidden_sizes,
+            rnn_hidden_size=sb_model_hidden_size,
+            output_size=2,
+            sequence_model=sequence_model,
+        )
+
+        self.sb_output_activate_function = get_activation(
+            sb_output_activate_function
+        )
+
+        # ====================================================
+        # NORMALIZATION
+        # ====================================================
+
+        if norm_type == "offline_laplace_norm":
+            self.norm = OfflineLaplaceNorm()
+        else:
+            self.norm = OfflineLaplaceNorm()
+
+        # ====================================================
+        # WEIGHT INIT
+        # ====================================================
+        #
+        # QUAN TRỌNG: không gọi khi load checkpoint (weight_init=False),
+        # chỉ dùng khi train from scratch.
+
+        if weight_init:
+            generic_weight_init(self)
+
+    def forward(self, noisy_mag):
+        """
+        Input:
+            noisy_mag: (B, 1, F, T)
+
+        Output:
+            compressed cIRM: (B, 2, F, T)
+        """
+
+        # ====================================================
+        # LOOK AHEAD
+        # ====================================================
+
+        noisy_mag = F.pad(
+            noisy_mag,
+            (0, self.look_ahead),
+        )
+
+        (
+            batch_size,
+            num_channels,
+            num_freqs,
+            num_frames,
+        ) = noisy_mag.shape
+
+        # ====================================================
+        # NORMALIZE
+        # ====================================================
+
+        noisy_mag = self.norm(noisy_mag)
+
+        # ====================================================
+        # FREQUENCY NEIGHBORS (subband units)
+        # ====================================================
+
+        sb_input = freq_unfold(
+            noisy_mag,
+            num_neighbors=self.sb_num_neighbors,
+        )
+
+        sb_input = sb_input.reshape(
+            batch_size,
+            self.sb_num_neighbors * 2 + 1,
+            num_freqs,
+            num_frames,
+        )
+
+        # ====================================================
+        # DROP BAND (chỉ áp dụng khi train, batch_size > 1)
+        # ====================================================
+
+        if batch_size > 1:
+
+            sb_input = drop_band(
+                sb_input,
+                num_groups=self.num_groups_in_drop_band,
+            )
+
+            num_freqs = sb_input.shape[2]
+
+        # ====================================================
+        # (B, C, F, T) -> (B, F, T, C) CHO SUBBAND INTERACTION
+        # ====================================================
+
+        sb_input = sb_input.permute(0, 2, 3, 1)
+
+        # ====================================================
+        # SUB-BAND MODEL (SubInter + RNN x N blocks)
+        # ====================================================
+
+        sb_mask = self.sb_model(sb_input)
+        # (B, F, T, 2)
+
+        sb_mask = self.sb_output_activate_function(sb_mask)
+
+        sb_mask = sb_mask.permute(0, 3, 1, 2).contiguous()
+        # (B, 2, F, T)
+
+        # ====================================================
+        # REMOVE LOOK AHEAD
+        # ====================================================
+
+        return sb_mask[:, :, :, self.look_ahead:]
+
+
+# ============================================================
+# INTERSUBNET WAVEFORM WRAPPER
+# ============================================================
+
+class InterSubNetWrapper(InterSubNetCore):
+
+    def __init__(
+        self,
+        n_fft,
+        hop_length,
+        win_length,
+        **isn_kwargs,
+    ):
+        super().__init__(**isn_kwargs)
+
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+
+    def forward(self, noisy_waveform):
+
+        length = noisy_waveform.shape[-1]
+
+        # ====================================================
+        # STFT
+        # ====================================================
+
+        spec = stft(
+            noisy_waveform,
+            self.n_fft,
+            self.hop_length,
+            self.win_length,
+        )
+
+        mag = torch.abs(spec).unsqueeze(1)
+
+        # ====================================================
+        # INTERSUBNET -> COMPRESSED cIRM
+        # ====================================================
+
+        compressed_cirm = super().forward(mag)
+
+        # ====================================================
+        # DECOMPRESS cIRM
+        # ====================================================
+
+        cirm = decompress_cIRM(
+            compressed_cirm.permute(0, 2, 3, 1)
+        )
+
+        cirm = cirm.permute(0, 3, 1, 2)
+
+        mask_real = cirm[:, 0]
+        mask_imag = cirm[:, 1]
+
+        noisy_real = spec.real
         noisy_imag = spec.imag
 
         # ====================================================
@@ -1163,22 +1577,24 @@ class CRN(nn.Module):
 # BUILD MODEL
 # ============================================================
 
-def build_model(
-    cfg: dict,
-) -> nn.Module:
+def build_model(cfg: dict) -> nn.Module:
 
-    model_cfg = cfg[
-        "model"
-    ]
+    model_cfg = cfg["model"]
+    stft_cfg = cfg["stft"]
 
-    stft_cfg = cfg[
-        "stft"
-    ]
+    name = model_cfg.get("name", "FullSubNet")
 
-    name = model_cfg.get(
-        "name",
-        "CRN",
-    )
+    if name == "FullSubNet":
+        model_cfg = model_cfg["FullSubNet"]
+
+    elif name == "InterSubNet":
+        model_cfg = model_cfg["InterSubNet"]
+
+    elif name == "CRN":
+        model_cfg = model_cfg
+
+    else:
+        raise ValueError(f"Unknown model name: {name}")
 
     # ========================================================
     # CRN
@@ -1187,17 +1603,9 @@ def build_model(
     if name == "CRN":
 
         return CRN(
-            n_fft=stft_cfg[
-                "n_fft"
-            ],
-
-            hop_length=stft_cfg[
-                "hop_length"
-            ],
-
-            win_length=stft_cfg[
-                "win_length"
-            ],
+            n_fft=stft_cfg["n_fft"],
+            hop_length=stft_cfg["hop_length"],
+            win_length=stft_cfg["win_length"],
 
             base_channels=model_cfg.get(
                 "base_channels",
@@ -1223,60 +1631,36 @@ def build_model(
 
         return FullSubNetWrapper(
 
-            n_fft=stft_cfg[
-                "n_fft"
-            ],
+            n_fft=stft_cfg["n_fft"],
 
-            hop_length=stft_cfg[
-                "hop_length"
-            ],
+            hop_length=stft_cfg["hop_length"],
 
-            win_length=stft_cfg[
-                "win_length"
-            ],
+            win_length=stft_cfg["win_length"],
 
-            num_freqs=model_cfg[
-                "num_freqs"
-            ],
+            num_freqs=model_cfg["num_freqs"],
 
-            look_ahead=model_cfg[
-                "look_ahead"
-            ],
+            look_ahead=model_cfg["look_ahead"],
 
-            sequence_model=model_cfg[
-                "sequence_model"
-            ],
+            sequence_model=model_cfg["sequence_model"],
 
-            fb_num_neighbors=model_cfg[
-                "fb_num_neighbors"
-            ],
+            fb_num_neighbors=model_cfg["fb_num_neighbors"],
 
-            sb_num_neighbors=model_cfg[
-                "sb_num_neighbors"
-            ],
+            sb_num_neighbors=model_cfg["sb_num_neighbors"],
 
             fb_output_activate_function=(
-                model_cfg[
-                    "fb_output_activate_function"
-                ]
+                model_cfg["fb_output_activate_function"]
             ),
 
             sb_output_activate_function=(
-                model_cfg[
-                    "sb_output_activate_function"
-                ]
+                model_cfg["sb_output_activate_function"]
             ),
 
             fb_model_hidden_size=(
-                model_cfg[
-                    "fb_model_hidden_size"
-                ]
+                model_cfg["fb_model_hidden_size"]
             ),
 
             sb_model_hidden_size=(
-                model_cfg[
-                    "sb_model_hidden_size"
-                ]
+                model_cfg["sb_model_hidden_size"]
             ),
 
             norm_type=model_cfg.get(
@@ -1291,12 +1675,74 @@ def build_model(
                 )
             ),
 
-            # QUAN TRỌNG
-            # Không init weight mới
-            # vì chúng ta sẽ load checkpoint.
+            weight_init=False,
+        )
+
+    # ========================================================
+    # INTERSUBNET
+    # ========================================================
+
+    elif name == "InterSubNet":
+
+        # InterSubNet KHÔNG có nhánh full-band (fb_model), nên
+        # không cần / không dùng các tham số fb_num_neighbors,
+        # fb_model_hidden_size, fb_output_activate_function.
+        #
+        # sil_hidden_sizes: kích thước hidden của từng khối
+        # SubInter (SIL block), mặc định (93, 307) khớp với
+        # checkpoint tham chiếu (InTerSubNet_EN.tar). Nếu bạn có
+        # checkpoint khác với số lượng/khác kích thước SIL block,
+        # hãy khai báo "sil_hidden_sizes" trong model_cfg.
+
+        return InterSubNetWrapper(
+
+            n_fft=stft_cfg["n_fft"],
+
+            hop_length=stft_cfg["hop_length"],
+
+            win_length=stft_cfg["win_length"],
+
+            num_freqs=model_cfg["num_freqs"],
+
+            look_ahead=model_cfg["look_ahead"],
+
+            sequence_model=model_cfg["sequence_model"],
+
+            sb_num_neighbors=model_cfg["sb_num_neighbors"],
+
+            sb_output_activate_function=(
+                model_cfg["sb_output_activate_function"]
+            ),
+
+            sb_model_hidden_size=(
+                model_cfg["sb_model_hidden_size"]
+            ),
+
+            sil_hidden_sizes=tuple(
+                model_cfg.get(
+                    "sil_hidden_sizes",
+                    (93, 307),
+                )
+            ),
+
+            norm_type=model_cfg.get(
+                "norm_type",
+                "offline_laplace_norm",
+            ),
+
+            num_groups_in_drop_band=(
+                model_cfg.get(
+                    "num_groups_in_drop_band",
+                    2,
+                )
+            ),
 
             weight_init=False,
         )
+
+    # ========================================================
+    # UNKNOWN MODEL
+    # ========================================================
 
     else:
 

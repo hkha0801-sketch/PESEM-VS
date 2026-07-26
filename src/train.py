@@ -9,140 +9,438 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from utils import load_config, set_seed, get_device, save_checkpoint, load_checkpoint
+from utils import (
+    load_config,
+    set_seed,
+    get_device,
+    save_checkpoint,
+    load_checkpoint,
+)
+
 from dataset import SpeechEnhancementDataset, collate_fn
 from model import build_model
 from losses import get_loss_fn
-from metrics import evaluate_batch
 
 
-def run_epoch(model, loader, loss_fn, optimizer, device, grad_clip, train=True):
-    model.train() if train else model.eval()
+def run_epoch(
+    model,
+    loader,
+    loss_fn,
+    optimizer,
+    device,
+    grad_clip,
+):
+    """
+    Train model for one epoch.
+    """
+
+    model.train()
+
     total_loss = 0.0
     n_batches = 0
 
-    context = torch.enable_grad() if train else torch.no_grad()
-    with context:
-        for noisy, clean in tqdm(loader, desc="train" if train else "val", leave=False):
-            noisy, clean = noisy.to(device), clean.to(device)
-            est = model(noisy)
-            min_len = min(est.shape[-1], clean.shape[-1])
-            loss = loss_fn(est[..., :min_len], clean[..., :min_len])
+    for noisy, clean in tqdm(
+        loader,
+        desc="train",
+        leave=False
+    ):
+        noisy = noisy.to(device)
+        clean = clean.to(device)
 
-            if train:
-                optimizer.zero_grad()
-                loss.backward()
-                if grad_clip:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
+        # Forward
+        est = model(noisy)
 
-            total_loss += loss.item()
-            n_batches += 1
+        # Đảm bảo output và target có cùng chiều dài
+        min_len = min(
+            est.shape[-1],
+            clean.shape[-1]
+        )
 
-    return total_loss / max(n_batches, 1)
+        est = est[..., :min_len]
+        clean = clean[..., :min_len]
 
+        # Calculate loss
+        loss = loss_fn(
+            est,
+            clean
+        )
 
-def evaluate_test_set(model, loader, device, sample_rate):
-    model.eval()
-    all_metrics = {}
-    n = 0
-    with torch.no_grad():
-        for noisy, clean in tqdm(loader, desc="test", leave=False):
-            noisy = noisy.to(device)
-            est = model(noisy).cpu()
-            min_len = min(est.shape[-1], clean.shape[-1])
-            m = evaluate_batch(est[..., :min_len], clean[..., :min_len], sr=sample_rate)
-            for k, v in m.items():
-                all_metrics[k] = all_metrics.get(k, 0.0) + v
-            n += 1
-    return {k: v / max(n, 1) for k, v in all_metrics.items()}
+        # Backward
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        # Gradient clipping
+        if grad_clip:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                grad_clip
+            )
+
+        # Update weights
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / max(
+        n_batches,
+        1
+    )
 
 
 def main():
+
+    # =========================================================
+    # ARGUMENTS
+    # =========================================================
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--resume", type=str, default=None, help="path to checkpoint to resume from")
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True
+    )
+
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume training"
+    )
+
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    set_seed(cfg["train"].get("seed", 42))
-    device = get_device(cfg["train"].get("device", "auto"))
-    print(f"[INFO] device = {device}")
+
+    # =========================================================
+    # LOAD CONFIG
+    # =========================================================
+
+    cfg = load_config(
+        args.config
+    )
+
+
+    # =========================================================
+    # SET SEED
+    # =========================================================
+
+    set_seed(
+        cfg["train"].get(
+            "seed",
+            42
+        )
+    )
+
+
+    # =========================================================
+    # DEVICE
+    # =========================================================
+
+    device = get_device(
+        cfg["train"].get(
+            "device",
+            "auto"
+        )
+    )
+
+    print(
+        f"[INFO] device = {device}"
+    )
+
+
+    # =========================================================
+    # DATASET
+    # =========================================================
 
     data_cfg = cfg["data"]
+
+    print(
+        "[INFO] Loading training dataset..."
+    )
+
     train_ds = SpeechEnhancementDataset(
-        data_cfg["train_csv"], sample_rate=data_cfg["sample_rate"],
-        segment_seconds=data_cfg["segment_seconds"], train=True,
+        data_cfg["train_csv"],
+        sample_rate=data_cfg["sample_rate"],
+        segment_seconds=data_cfg["segment_seconds"],
+        train=True,
     )
-    val_ds = SpeechEnhancementDataset(
-        data_cfg["val_csv"], sample_rate=data_cfg["sample_rate"],
-        segment_seconds=data_cfg["segment_seconds"], train=False,
+
+    print(
+        f"[INFO] Number of training samples: {len(train_ds)}"
     )
+
+
+    # =========================================================
+    # DATALOADER
+    # =========================================================
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True,
-        num_workers=cfg["train"]["num_workers"], collate_fn=collate_fn, drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg["train"]["batch_size"], shuffle=False,
-        num_workers=cfg["train"]["num_workers"], collate_fn=collate_fn,
+        train_ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["train"]["num_workers"],
+        collate_fn=collate_fn,
+        drop_last=True,
     )
 
-    model = build_model(cfg).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"].get("weight_decay", 0.0)
+
+    # =========================================================
+    # MODEL
+    # =========================================================
+
+    print(
+        "[INFO] Building model..."
     )
-    loss_fn = get_loss_fn(cfg["train"]["loss"], stft_cfg=cfg["stft"])
+
+    model = build_model(
+        cfg
+    ).to(device)
+
+
+    # =========================================================
+    # OPTIMIZER
+    # =========================================================
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg["train"]["lr"],
+        weight_decay=cfg["train"].get(
+            "weight_decay",
+            0.0
+        ),
+    )
+
+
+    # =========================================================
+    # LOSS
+    # =========================================================
+
+    loss_fn = get_loss_fn(
+        cfg["train"]["loss"],
+        stft_cfg=cfg["stft"]
+    )
+
+
+    # =========================================================
+    # RESUME TRAINING
+    # =========================================================
 
     start_epoch = 0
-    best_val = float("inf")
+
+    best_train_loss = float(
+        "inf"
+    )
+
     if args.resume:
-        start_epoch, best_val = load_checkpoint(args.resume, model, optimizer, map_location=device)
-        print(f"[INFO] resumed from {args.resume}, epoch={start_epoch}, best_val={best_val:.4f}")
 
-    ckpt_dir = cfg["train"]["checkpoint_dir"]
-    os.makedirs(ckpt_dir, exist_ok=True)
-    writer = SummaryWriter(cfg["train"].get("log_dir", "runs"))
-
-    patience = cfg["train"].get("early_stop_patience", 15)
-    epochs_no_improve = 0
-
-    for epoch in range(start_epoch, cfg["train"]["epochs"]):
-        train_loss = run_epoch(model, train_loader, loss_fn, optimizer, device,
-                                cfg["train"].get("grad_clip"), train=True)
-        val_loss = run_epoch(model, val_loader, loss_fn, optimizer, device,
-                              cfg["train"].get("grad_clip"), train=False)
-
-        print(f"[Epoch {epoch+1}/{cfg['train']['epochs']}] train_loss={train_loss:.4f} val_loss={val_loss:.4f}")
-        writer.add_scalar("loss/train", train_loss, epoch)
-        writer.add_scalar("loss/val", val_loss, epoch)
-
-        save_checkpoint(os.path.join(ckpt_dir, "last.pt"), model, optimizer, epoch + 1, best_val, cfg)
-
-        if val_loss < best_val:
-            best_val = val_loss
-            epochs_no_improve = 0
-            save_checkpoint(os.path.join(ckpt_dir, "best.pt"), model, optimizer, epoch + 1, best_val, cfg)
-            print(f"[INFO] new best model saved, val_loss={val_loss:.4f}")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"[INFO] early stopping tại epoch {epoch+1} (không cải thiện {patience} epoch)")
-                break
-
-    # Đánh giá tập test nếu có
-    test_csv = data_cfg.get("test_csv")
-    if test_csv and os.path.exists(test_csv):
-        print("[INFO] đánh giá trên tập test...")
-        test_ds = SpeechEnhancementDataset(
-            test_csv, sample_rate=data_cfg["sample_rate"], segment_seconds=None, train=False,
+        start_epoch, best_train_loss = load_checkpoint(
+            args.resume,
+            model,
+            optimizer,
+            map_location=device
         )
-        test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, collate_fn=collate_fn)
-        load_checkpoint(os.path.join(ckpt_dir, "best.pt"), model, map_location=device)
-        metrics = evaluate_test_set(model, test_loader, device, data_cfg["sample_rate"])
-        print(f"[TEST METRICS] {metrics}")
+
+        print(
+            f"[INFO] Resumed from: {args.resume}"
+        )
+
+        print(
+            f"[INFO] Starting epoch: {start_epoch}"
+        )
+
+        print(
+            f"[INFO] Best train loss: {best_train_loss:.4f}"
+        )
+
+
+    # =========================================================
+    # CHECKPOINT DIRECTORY
+    # =========================================================
+
+    ckpt_dir = cfg["train"][
+        "checkpoint_dir"
+    ]
+
+    os.makedirs(
+        ckpt_dir,
+        exist_ok=True
+    )
+
+
+    # =========================================================
+    # TENSORBOARD
+    # =========================================================
+
+    writer = SummaryWriter(
+        cfg["train"].get(
+            "log_dir",
+            "runs"
+        )
+    )
+
+
+    # =========================================================
+    # TRAINING
+    # =========================================================
+
+    epochs = cfg["train"][
+        "epochs"
+    ]
+
+    grad_clip = cfg["train"].get(
+        "grad_clip"
+    )
+
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "START TRAINING"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print(
+        f"Device       : {device}"
+    )
+
+    print(
+        f"Epochs       : {epochs}"
+    )
+
+    print(
+        f"Batch size   : {cfg['train']['batch_size']}"
+    )
+
+    print(
+        f"Learning rate: {cfg['train']['lr']}"
+    )
+
+    print(
+        f"Loss         : {cfg['train']['loss']}"
+    )
+
+    print(
+        "========================================\n"
+    )
+
+
+    for epoch in range(
+        start_epoch,
+        epochs
+    ):
+
+        train_loss = run_epoch(
+            model=model,
+            loader=train_loader,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            device=device,
+            grad_clip=grad_clip,
+        )
+
+
+        # =====================================================
+        # PRINT LOG
+        # =====================================================
+
+        print(
+            f"[Epoch {epoch + 1}/{epochs}] "
+            f"train_loss={train_loss:.4f}"
+        )
+
+
+        # =====================================================
+        # TENSORBOARD
+        # =====================================================
+
+        writer.add_scalar(
+            "loss/train",
+            train_loss,
+            epoch
+        )
+
+
+        # =====================================================
+        # SAVE LAST CHECKPOINT
+        # =====================================================
+
+        save_checkpoint(
+            os.path.join(
+                ckpt_dir,
+                "last.pt"
+            ),
+            model,
+            optimizer,
+            epoch + 1,
+            best_train_loss,
+            cfg
+        )
+
+
+        # =====================================================
+        # SAVE BEST CHECKPOINT
+        # =====================================================
+
+        if train_loss < best_train_loss:
+
+            best_train_loss = train_loss
+
+            save_checkpoint(
+                os.path.join(
+                    ckpt_dir,
+                    "best.pt"
+                ),
+                model,
+                optimizer,
+                epoch + 1,
+                best_train_loss,
+                cfg
+            )
+
+            print(
+                f"[INFO] New best model saved!"
+            )
+
+            print(
+                f"[INFO] Best train loss = "
+                f"{best_train_loss:.4f}"
+            )
+
+
+    # =========================================================
+    # FINISH
+    # =========================================================
 
     writer.close()
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "TRAINING FINISHED"
+    )
+
+    print(
+        "========================================"
+    )
+
+    print(
+        f"Best model: "
+        f"{os.path.join(ckpt_dir, 'best.pt')}"
+    )
+
+    print(
+        f"Last model: "
+        f"{os.path.join(ckpt_dir, 'last.pt')}"
+    )
 
 
 if __name__ == "__main__":

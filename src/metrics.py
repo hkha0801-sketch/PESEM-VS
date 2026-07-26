@@ -1,97 +1,89 @@
 import os
-import librosa
 import numpy as np
-
+import soundfile as sf
 from pesq import pesq
 from pystoi import stoi
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+CLEAN_DIR = "inputTestClean"
+ENHANCED_DIR = "output"
+RESULT_FILE = "INTERSUBNET_EN.txt"
 
 
-CLEAN_DIR = os.path.join(ROOT_DIR, "input")
-ENHANCED_DIR = os.path.join(ROOT_DIR, "output", "enhanced")
-RESULT_FILE = os.path.join(ROOT_DIR, "metrics_result.txt")
+def main():
+    results = []
 
-SAMPLE_RATE = 16000
+    for filename in sorted(os.listdir(CLEAN_DIR)):
+        if not filename.endswith(".wav"):
+            continue
 
-pesq_scores = []
-stoi_scores = []
+        clean_path = os.path.join(CLEAN_DIR, filename)
+        enhanced_path = os.path.join(ENHANCED_DIR, filename)
 
-result_lines = []
+        if not os.path.exists(enhanced_path):
+            continue
 
-header = f"{'File':35s} {'PESQ':>8} {'STOI':>8}"
-print(header)
-print("-" * len(header))
+        clean, sr_clean = sf.read(clean_path, dtype="float32")
+        enhanced, sr_enhanced = sf.read(enhanced_path, dtype="float32")
 
-result_lines.append(header)
-result_lines.append("-" * len(header))
+        min_len = min(len(clean), len(enhanced))
+        clean = clean[:min_len]
+        enhanced = enhanced[:min_len]
 
-for file in sorted(os.listdir(CLEAN_DIR)):
+        try:
+            pesq_score = pesq(
+                16000,
+                clean,
+                enhanced,
+                "wb"
+            )
 
-    if not file.endswith(".wav"):
-        continue
+            stoi_score = stoi(
+                clean,
+                enhanced,
+                16000,
+                extended=False
+            )
 
-    clean_path = os.path.join(CLEAN_DIR, file)
-    enhanced_path = os.path.join(ENHANCED_DIR, file)
+            results.append(
+                (filename, pesq_score, stoi_score)
+            )
 
-    if not os.path.exists(enhanced_path):
-        continue
+        except Exception as e:
+            print(f"Lỗi {filename}: {e}")
 
-    try:
-
-        clean, _ = librosa.load(clean_path, sr=SAMPLE_RATE)
-        enhanced, _ = librosa.load(enhanced_path, sr=SAMPLE_RATE)
-
-        length = min(len(clean), len(enhanced))
-        clean = clean[:length]
-        enhanced = enhanced[:length]
-
-        pesq_score = pesq(
-            SAMPLE_RATE,
-            clean,
-            enhanced,
-            "wb"
+    with open(RESULT_FILE, "w") as f:
+        f.write(
+            f"{'File':<30}"
+            f"{'PESQ':>10}"
+            f"{'STOI':>10}\n"
         )
 
-        stoi_score = stoi(
-            clean,
-            enhanced,
-            SAMPLE_RATE,
-            extended=False
+        f.write("-" * 50 + "\n")
+
+        for filename, pesq_score, stoi_score in results:
+            f.write(
+                f"{filename:<30}"
+                f"{pesq_score:>10.3f}"
+                f"{stoi_score:>10.3f}\n"
+            )
+
+        avg_pesq = np.mean([x[1] for x in results])
+        avg_stoi = np.mean([x[2] for x in results])
+
+        f.write("-" * 50 + "\n")
+        f.write(
+            f"{'Average':<30}"
+            f"{avg_pesq:>10.3f}"
+            f"{avg_stoi:>10.3f}\n"
         )
 
-        pesq_scores.append(pesq_score)
-        stoi_scores.append(stoi_score)
 
-        line = f"{file:35s} {pesq_score:8.3f} {stoi_score:8.3f}"
+        print(f"Đã lưu kết quả: {RESULT_FILE}")
 
-        print(line)
-        result_lines.append(line)
-
-    except:
-        continue
+        
 
 
-print("-" * len(header))
-result_lines.append("-" * len(header))
+if __name__ == "__main__":
+    main()
 
-if len(pesq_scores) > 0:
-
-    avg_pesq = np.mean(pesq_scores)
-    avg_stoi = np.mean(stoi_scores)
-
-    avg_line = f"{'Average':35s} {avg_pesq:8.3f} {avg_stoi:8.3f}"
-
-    print(avg_line)
-    result_lines.append(avg_line)
-
-else:
-
-    print("No valid audio pairs found.")
-    result_lines.append("No valid audio pairs found.")
-
-
-with open(RESULT_FILE, "w", encoding="utf-8") as f:
-    f.write("\n".join(result_lines))
-
-print(f"\nResults saved to: {RESULT_FILE}")

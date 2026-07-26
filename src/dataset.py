@@ -8,12 +8,6 @@ from torch.utils.data import Dataset
 
 
 class SpeechEnhancementDataset(Dataset):
-    """Đọc file CSV có 2 cột: noisy,clean (đường dẫn tuyệt đối hoặc tương đối tới file wav).
-
-    Trong lúc train, mỗi audio được cắt (random crop) hoặc pad về đúng
-    `segment_seconds` để có thể batch được. Khi eval/test có thể set
-    segment_seconds=None để lấy nguyên full audio (batch_size phải =1).
-    """
 
     def __init__(self, csv_path: str, sample_rate: int = 16000,
                  segment_seconds: float = None, train: bool = True):
@@ -30,7 +24,11 @@ class SpeechEnhancementDataset(Dataset):
         return len(self.entries)
 
     def _load(self, path: str) -> torch.Tensor:
-        wav_np, sr = sf.read(path, dtype="float32", always_2d=True)  # (T, C)
+        try:
+            wav_np, sr = sf.read(path, dtype="float32", always_2d=True)  # (T, C)
+        except Exception as e:
+            raise RuntimeError(f"[dataset] Không đọc được file audio: {path}") from e
+
         wav = torch.from_numpy(wav_np.T)  # (C, T)
         if wav.shape[0] > 1:  # stereo -> mono
             wav = wav.mean(dim=0, keepdim=True)

@@ -1,4 +1,4 @@
-# Speech Enhancement with FullSubNet
+# Speech Enhancement 
 
 A PyTorch-based Speech Enhancement project for training and inference on a local paired noisy-clean speech dataset.
 

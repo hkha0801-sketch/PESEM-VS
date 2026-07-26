@@ -10,10 +10,7 @@ from utils import stft, istft
 # ============================================================
 
 def get_activation(name):
-    """
-    Tạo activation function tương ứng với config.
-    Checkpoint của bạn đang dùng null nên mặc định Identity.
-    """
+
     if name is None:
         return nn.Identity()
 
@@ -406,10 +403,6 @@ class FullSubNetCore(nn.Module):
         # WEIGHT INIT
         # ====================================================
 
-        # QUAN TRỌNG:
-        # Không initialize lại khi load checkpoint.
-        #
-        # Nhưng giữ argument để tương thích config.
 
         if weight_init:
             self._weight_init()
@@ -612,8 +605,6 @@ class FullSubNetWrapper(
         **fsn_kwargs,
     ):
 
-        # QUAN TRỌNG:
-        # Truyền fsn_kwargs vào FullSubNetCore
 
         super().__init__(
             **fsn_kwargs
@@ -734,13 +725,890 @@ class FullSubNetWrapper(
 
 
 
-class SubbandInteraction(nn.Module):
-    """
-    Module SubInter: kết hợp thông tin cục bộ (local, theo từng
-    subband) với thông tin toàn cục (global, trung bình theo tần số).
+# ============================================================
+# FULLSUBNET+ — CÁC MODULE PHỤ TRỢ
+# ============================================================
+#
+# Phần dưới đây triển khai lại đúng kiến trúc gốc của FullSubNet+
+# ("FullSubNet+: Channel Attention FullSubNet with Complex
+# Spectrograms for Speech Enhancement", Chen et al., ICASSP 2022,
+# repo: RookieJunChen/FullSubNet-plus), để tương thích với checkpoint
+# .tar được huấn luyện từ repo gốc.
+#
+# Khác với FullSubNet:
+#   - Dùng 3 full-band model riêng biệt (magnitude, real, imaginary),
+#     mỗi cái là 1 chuỗi 8 khối TCN (Temporal Convolutional Network)
+#     thay vì LSTM/GRU.
+#   - Mỗi luồng có 1 lớp channel attention riêng (mặc định: MulCA /
+#     "TSSE" - Time-Sense Squeeze-and-Excitation) áp dụng theo chiều
+#     tần số trước khi đưa vào full-band model.
+#   - Sub-band model nhận input là nối 4 phần: noisy mag neighbor +
+#     3 full-band output neighbor (mag/real/imag).
 
-    Input / Output: (B, F, T, C) với C = input_size (không đổi).
+
+# ------------------------------------------------------------
+# CHANNEL ATTENTION LAYERS (theo attention_model.py gốc)
+# ------------------------------------------------------------
+
+class ChannelSELayer(nn.Module):
     """
+    Squeeze-and-Excitation (SE) block, hoạt động theo chiều channel.
+
+    Input:
+        (B, num_channels, T)
+    """
+
+    def __init__(self, num_channels, reduction_ratio=2):
+        super().__init__()
+
+        num_channels_reduced = num_channels // reduction_ratio
+
+        self.fc1 = nn.Linear(num_channels, num_channels_reduced, bias=True)
+
+        self.fc2 = nn.Linear(num_channels_reduced, num_channels, bias=True)
+
+        self.relu = nn.ReLU()
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_tensor):
+
+        squeeze_tensor = input_tensor.mean(dim=2)
+
+        fc_out_1 = self.relu(self.fc1(squeeze_tensor))
+
+        fc_out_2 = self.sigmoid(self.fc2(fc_out_1))
+
+        a, b = squeeze_tensor.size()
+
+        return torch.mul(
+            input_tensor,
+            fc_out_2.view(a, b, 1),
+        )
+
+
+class ChannelCBAMLayer(nn.Module):
+    """
+    Channel attention kiểu CBAM (dùng cả avg-pool và max-pool).
+
+    Input:
+        (B, num_channels, T)
+    """
+
+    def __init__(self, num_channels, reduction_ratio=2):
+        super().__init__()
+
+        num_channels_reduced = num_channels // reduction_ratio
+
+        self.fc1 = nn.Linear(num_channels, num_channels_reduced, bias=True)
+
+        self.fc2 = nn.Linear(num_channels_reduced, num_channels, bias=True)
+
+        self.relu = nn.ReLU()
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_tensor):
+
+        mean_squeeze_tensor = input_tensor.mean(dim=2)
+
+        max_squeeze_tensor, _ = torch.max(input_tensor, dim=2)
+
+        mean_fc_out_1 = self.relu(self.fc1(mean_squeeze_tensor))
+
+        max_fc_out_1 = self.relu(self.fc1(max_squeeze_tensor))
+
+        fc_out_1 = mean_fc_out_1 + max_fc_out_1
+
+        fc_out_2 = self.sigmoid(self.fc2(fc_out_1))
+
+        a, b = mean_squeeze_tensor.size()
+
+        return torch.mul(
+            input_tensor,
+            fc_out_2.view(a, b, 1),
+        )
+
+
+class ChannelECALayer(nn.Module):
+    """
+    Efficient Channel Attention (ECA).
+
+    Input:
+        (B, num_channels, T)
+    """
+
+    def __init__(self, channel, k_size=3):
+        super().__init__()
+
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+
+        self.conv = nn.Conv1d(
+            1, 1,
+            kernel_size=k_size,
+            padding=(k_size - 1) // 2,
+            bias=False,
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+
+        y = self.avg_pool(x)
+
+        y = self.conv(
+            y.transpose(-1, -2)
+        ).transpose(-1, -2)
+
+        y = self.sigmoid(y)
+
+        return x * y.expand_as(x)
+
+
+class ChannelTimeSenseSELayer(nn.Module):
+    """
+    MulCA: multi-scale time-sensitive channel attention (SE).
+
+    Dùng 3 nhánh Conv1d (kernel nhỏ/vừa/lớn) để lấy đặc trưng đa tỉ lệ
+    theo chiều thời gian, sau đó gộp lại bằng 1 lớp FC rồi mới đi qua
+    squeeze-excite như SE thông thường.
+
+    Input:
+        (B, num_channels, T)
+    """
+
+    def __init__(
+        self,
+        num_channels,
+        reduction_ratio=2,
+        kersize=(3, 5, 10),
+        subband_num=1,
+    ):
+        super().__init__()
+
+        num_channels_reduced = num_channels // reduction_ratio
+
+        groups = num_channels // subband_num
+
+        self.smallConv1d = nn.Sequential(
+            nn.Conv1d(num_channels, num_channels, kernel_size=kersize[0], groups=groups),
+            nn.AdaptiveAvgPool1d(1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.middleConv1d = nn.Sequential(
+            nn.Conv1d(num_channels, num_channels, kernel_size=kersize[1], groups=groups),
+            nn.AdaptiveAvgPool1d(1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.largeConv1d = nn.Sequential(
+            nn.Conv1d(num_channels, num_channels, kernel_size=kersize[2], groups=groups),
+            nn.AdaptiveAvgPool1d(1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.feature_concate_fc = nn.Linear(3, 1, bias=True)
+
+        self.fc1 = nn.Linear(num_channels, num_channels_reduced, bias=True)
+
+        self.fc2 = nn.Linear(num_channels_reduced, num_channels, bias=True)
+
+        self.relu = nn.ReLU()
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_tensor):
+
+        small_feature = self.smallConv1d(input_tensor)
+
+        middle_feature = self.middleConv1d(input_tensor)
+
+        large_feature = self.largeConv1d(input_tensor)
+
+        feature = torch.cat(
+            [small_feature, middle_feature, large_feature],
+            dim=2,
+        )
+
+        squeeze_tensor = self.feature_concate_fc(feature)[..., 0]
+
+        fc_out_1 = self.relu(self.fc1(squeeze_tensor))
+
+        fc_out_2 = self.sigmoid(self.fc2(fc_out_1))
+
+        a, b = squeeze_tensor.size()
+
+        return torch.mul(
+            input_tensor,
+            fc_out_2.view(a, b, 1),
+        )
+
+
+def get_plus_channel_attention(name, num_channels, kersize=(3, 5, 10)):
+    """
+    Factory chọn loại channel attention cho FullSubNet+.
+
+    Hỗ trợ: "SE", "ECA", "CBAM", "TSSE" (không phân biệt hoa/thường).
+    Mặc định (và cũng là kiến trúc dùng trong checkpoint gốc): "TSSE".
+    """
+
+    key = str(name).upper() if name else "TSSE"
+
+    if key == "SE":
+        return ChannelSELayer(num_channels=num_channels)
+
+    if key == "ECA":
+        return ChannelECALayer(channel=num_channels)
+
+    if key == "CBAM":
+        return ChannelCBAMLayer(num_channels=num_channels)
+
+    # "TSSE" hoặc bất kỳ giá trị nào khác -> mặc định TSSE (MulCA)
+    return ChannelTimeSenseSELayer(
+        num_channels=num_channels,
+        kersize=kersize,
+    )
+
+
+# ------------------------------------------------------------
+# TCN BLOCK + FULL-BAND EXTRACTOR (theo causal_conv.py gốc)
+# ------------------------------------------------------------
+
+class TCNBlockPlus(nn.Module):
+    """
+    1 khối TCN (Temporal Convolutional Network), dùng làm full-band
+    model trong FullSubNet+ thay cho LSTM/GRU.
+
+    Input / Output:
+        (B, channels, T)
+    """
+
+    def __init__(
+        self,
+        in_channels=257,
+        hidden_channel=512,
+        out_channels=257,
+        kernel_size=3,
+        dilation=1,
+        use_skip_connection=True,
+        causal=False,
+    ):
+        super().__init__()
+
+        self.conv1x1 = nn.Conv1d(in_channels, hidden_channel, 1)
+
+        self.prelu1 = nn.PReLU()
+
+        self.norm1 = nn.GroupNorm(1, hidden_channel, eps=1e-8)
+
+        padding = (
+            (dilation * (kernel_size - 1)) // 2
+            if not causal
+            else (dilation * (kernel_size - 1))
+        )
+
+        self.depthwise_conv = nn.Conv1d(
+            hidden_channel,
+            hidden_channel,
+            kernel_size=kernel_size,
+            stride=1,
+            groups=hidden_channel,
+            padding=padding,
+            dilation=dilation,
+        )
+
+        self.prelu2 = nn.PReLU()
+
+        self.norm2 = nn.GroupNorm(1, hidden_channel, eps=1e-8)
+
+        self.sconv = nn.Conv1d(hidden_channel, out_channels, 1)
+
+        self.causal = causal
+
+        self.padding = padding
+
+        self.use_skip_connection = use_skip_connection
+
+    def forward(self, x):
+
+        y = self.conv1x1(x)
+
+        y = self.norm1(self.prelu1(y))
+
+        y = self.depthwise_conv(y)
+
+        if self.causal:
+            y = y[:, :, :-self.padding]
+
+        y = self.norm2(self.prelu2(y))
+
+        output = self.sconv(y)
+
+        if self.use_skip_connection:
+            return x + output
+
+        return output
+
+
+class TCNSequenceModel(nn.Module):
+    """
+    Full-band model dạng TCN dùng trong FullSubNet+
+    (tương ứng SequenceModel(sequence_model="TCN") trong repo gốc).
+
+    Gồm 8 khối TCNBlockPlus (dilation lần lượt 1,2,5,9,1,2,5,9) rồi
+    ReLU, sau đó 1 lớp Linear để ra output_size, cuối cùng là hàm
+    activation tùy chọn.
+
+    Input:
+        (B, input_size, T)
+
+    Output:
+        (B, output_size, T)
+    """
+
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        hidden_channel=512,
+        output_activate_function=None,
+    ):
+        super().__init__()
+
+        dilations = (1, 2, 5, 9, 1, 2, 5, 9)
+
+        self.sequence_model = nn.Sequential(
+            *[
+                TCNBlockPlus(
+                    in_channels=input_size,
+                    hidden_channel=hidden_channel,
+                    out_channels=input_size,
+                    dilation=d,
+                )
+                for d in dilations
+            ],
+            nn.ReLU(),
+        )
+
+        self.fc_output_layer = nn.Linear(input_size, output_size)
+
+        self.output_activate_function = get_activation(
+            output_activate_function
+        )
+
+    def forward(self, x):
+
+        x = self.sequence_model(x)
+
+        o = self.fc_output_layer(
+            x.permute(0, 2, 1)
+        )
+
+        o = self.output_activate_function(o)
+
+        o = o.permute(0, 2, 1)
+
+        return o
+
+
+# ------------------------------------------------------------
+# NORMALIZE / UNFOLD / DROP-BAND RIÊNG CHO FULLSUBNET+
+# ------------------------------------------------------------
+#
+# Lưu ý: KHÔNG dùng chung freq_unfold / drop_band / OfflineLaplaceNorm
+# đã định nghĩa cho FullSubNet gốc ở trên, vì công thức chi tiết
+# (padding "reflect" thay vì "replicate", norm không lấy trị tuyệt
+# đối, ...) khác nhau, cần khớp chính xác với checkpoint đã train.
+
+class OfflineLaplaceNormPlus(nn.Module):
+    """
+    Chuẩn hóa kiểu "laplace" dùng trong FullSubNet+.
+
+    Input:
+        (B, C, F, T) (4 chiều bất kỳ)
+
+    mu = trung bình (KHÔNG lấy trị tuyệt đối) trên toàn bộ (C, F, T)
+    của từng mẫu trong batch.
+    """
+
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x):
+
+        mu = torch.mean(
+            x,
+            dim=(1, 2, 3),
+            keepdim=True,
+        )
+
+        return x / (mu + self.eps)
+
+
+def subband_unfold_plus(input_tensor, num_neighbor):
+    """
+    Unfold theo chiều tần số (dùng pad "reflect" + F.unfold),
+    giống hệt BaseModel.unfold() trong repo gốc.
+
+    Input:
+        (B, C, F, T)
+
+    Output:
+        (B, F, C, 2*num_neighbor + 1, T)
+    """
+
+    assert input_tensor.dim() == 4
+
+    (
+        batch_size,
+        num_channels,
+        num_freqs,
+        num_frames,
+    ) = input_tensor.size()
+
+    if num_neighbor < 1:
+        return input_tensor.permute(0, 2, 1, 3).reshape(
+            batch_size, num_freqs, num_channels, 1, num_frames,
+        )
+
+    output = input_tensor.reshape(
+        batch_size * num_channels, 1, num_freqs, num_frames,
+    )
+
+    sub_band_unit_size = num_neighbor * 2 + 1
+
+    output = F.pad(
+        output,
+        [0, 0, num_neighbor, num_neighbor],
+        mode="reflect",
+    )
+
+    output = F.unfold(
+        output,
+        (sub_band_unit_size, num_frames),
+    )
+
+    output = output.reshape(
+        batch_size, num_channels, sub_band_unit_size, num_frames, num_freqs,
+    )
+
+    output = output.permute(0, 4, 1, 2, 3).contiguous()
+
+    return output
+
+
+def subband_drop_band_plus(input_tensor, num_groups=2):
+    """
+    Drop-band dùng trong FullSubNet+ khi batch_size > num_groups
+    (chỉ có tác dụng lúc train nhiều batch; khi infer batch_size=1
+    thì hàm này không được gọi tới).
+    """
+
+    batch_size, _, num_freqs, _ = input_tensor.shape
+
+    if num_groups <= 1:
+        return input_tensor
+
+    if num_freqs % num_groups != 0:
+        input_tensor = input_tensor[
+            ..., :(num_freqs - (num_freqs % num_groups)), :
+        ]
+        num_freqs = input_tensor.shape[2]
+
+    output = []
+
+    for group_idx in range(num_groups):
+
+        samples_indices = torch.arange(
+            group_idx, batch_size, num_groups,
+            device=input_tensor.device,
+        )
+
+        freqs_indices = torch.arange(
+            group_idx, num_freqs, num_groups,
+            device=input_tensor.device,
+        )
+
+        selected_samples = torch.index_select(
+            input_tensor, dim=0, index=samples_indices,
+        )
+
+        selected = torch.index_select(
+            selected_samples, dim=2, index=freqs_indices,
+        )
+
+        output.append(selected)
+
+    return torch.cat(output, dim=0)
+
+
+# ============================================================
+# FULLSUBNET+ CORE
+# ============================================================
+
+class FullSubNetPlusCore(nn.Module):
+    """
+    FullSubNet+ (khớp state_dict với checkpoint gốc của
+    RookieJunChen/FullSubNet-plus).
+
+    Input:
+        noisy_mag, noisy_real, noisy_imag: (B, 1, F, T)
+
+    Output:
+        compressed cIRM: (B, output_size, F, T_valid)
+    """
+
+    def __init__(
+        self,
+        num_freqs,
+        look_ahead,
+        sequence_model,
+        fb_num_neighbors,
+        sb_num_neighbors,
+        fb_output_activate_function,
+        sb_output_activate_function,
+        fb_model_hidden_size,
+        sb_model_hidden_size,
+        channel_attention_model="TSSE",
+        norm_type="offline_laplace_norm",
+        num_groups_in_drop_band=2,
+        output_size=2,
+        subband_num=1,
+        kersize=(3, 5, 10),
+        weight_init=True,
+        **_ignored_extra_kwargs,
+    ):
+
+        super().__init__()
+
+        assert sequence_model in ("GRU", "LSTM", "TCN")
+
+        if subband_num == 1:
+            self.num_channels = num_freqs
+        else:
+            self.num_channels = num_freqs // subband_num + 1
+
+        # ====================================================
+        # CHANNEL ATTENTION (1 CÁI CHO MỖI LUỒNG MAG/REAL/IMAG)
+        # ====================================================
+
+        self.channel_attention = get_plus_channel_attention(
+            channel_attention_model, self.num_channels, kersize,
+        )
+
+        self.channel_attention_real = get_plus_channel_attention(
+            channel_attention_model, self.num_channels, kersize,
+        )
+
+        self.channel_attention_imag = get_plus_channel_attention(
+            channel_attention_model, self.num_channels, kersize,
+        )
+
+        # ====================================================
+        # 3 FULL-BAND MODEL (TCN) CHO MAG / REAL / IMAG
+        # ====================================================
+
+        self.fb_model = TCNSequenceModel(
+            input_size=num_freqs,
+            output_size=num_freqs,
+            hidden_channel=512,
+            output_activate_function=fb_output_activate_function,
+        )
+
+        self.fb_model_real = TCNSequenceModel(
+            input_size=num_freqs,
+            output_size=num_freqs,
+            hidden_channel=512,
+            output_activate_function=fb_output_activate_function,
+        )
+
+        self.fb_model_imag = TCNSequenceModel(
+            input_size=num_freqs,
+            output_size=num_freqs,
+            hidden_channel=512,
+            output_activate_function=fb_output_activate_function,
+        )
+
+        # ====================================================
+        # SUB-BAND MODEL (LSTM/GRU như FullSubNet gốc)
+        # ====================================================
+
+        self.sb_model = SequenceModel(
+            input_size=(
+                (sb_num_neighbors * 2 + 1)
+                + 3 * (fb_num_neighbors * 2 + 1)
+            ),
+            output_size=output_size,
+            hidden_size=sb_model_hidden_size,
+            num_layers=2,
+            bidirectional=False,
+            sequence_model=sequence_model,
+            output_activate_function=sb_output_activate_function,
+        )
+
+        self.subband_num = subband_num
+
+        self.sb_num_neighbors = sb_num_neighbors
+
+        self.fb_num_neighbors = fb_num_neighbors
+
+        self.look_ahead = look_ahead
+
+        self.num_groups_in_drop_band = num_groups_in_drop_band
+
+        self.output_size = output_size
+
+        if norm_type == "offline_laplace_norm":
+            self.norm = OfflineLaplaceNormPlus()
+
+        else:
+            self.norm = OfflineLaplaceNormPlus()
+
+        if weight_init:
+            generic_weight_init(self)
+
+    def forward(self, noisy_mag, noisy_real, noisy_imag):
+
+        noisy_mag = F.pad(noisy_mag, [0, self.look_ahead])
+
+        noisy_real = F.pad(noisy_real, [0, self.look_ahead])
+
+        noisy_imag = F.pad(noisy_imag, [0, self.look_ahead])
+
+        (
+            batch_size,
+            num_channels,
+            num_freqs,
+            num_frames,
+        ) = noisy_mag.size()
+
+        assert num_channels == 1
+
+        # ====================================================
+        # FULL-BAND MAGNITUDE
+        # ====================================================
+
+        fb_input = self.norm(noisy_mag).reshape(
+            batch_size, num_channels * num_freqs, num_frames,
+        )
+
+        fb_input = self.channel_attention(fb_input)
+
+        fb_output = self.fb_model(fb_input).reshape(
+            batch_size, 1, num_freqs, num_frames,
+        )
+
+        # ====================================================
+        # FULL-BAND REAL
+        # ====================================================
+
+        fbr_input = self.norm(noisy_real).reshape(
+            batch_size, num_channels * num_freqs, num_frames,
+        )
+
+        fbr_input = self.channel_attention_real(fbr_input)
+
+        fbr_output = self.fb_model_real(fbr_input).reshape(
+            batch_size, 1, num_freqs, num_frames,
+        )
+
+        # ====================================================
+        # FULL-BAND IMAGINARY
+        # ====================================================
+
+        fbi_input = self.norm(noisy_imag).reshape(
+            batch_size, num_channels * num_freqs, num_frames,
+        )
+
+        fbi_input = self.channel_attention_imag(fbi_input)
+
+        fbi_output = self.fb_model_imag(fbi_input).reshape(
+            batch_size, 1, num_freqs, num_frames,
+        )
+
+        # ====================================================
+        # UNFOLD 3 FULL-BAND OUTPUT + NOISY MAG NEIGHBORS
+        # ====================================================
+
+        fb_output_unfolded = subband_unfold_plus(
+            fb_output, self.fb_num_neighbors,
+        ).reshape(
+            batch_size, num_freqs, self.fb_num_neighbors * 2 + 1, num_frames,
+        )
+
+        fbr_output_unfolded = subband_unfold_plus(
+            fbr_output, self.fb_num_neighbors,
+        ).reshape(
+            batch_size, num_freqs, self.fb_num_neighbors * 2 + 1, num_frames,
+        )
+
+        fbi_output_unfolded = subband_unfold_plus(
+            fbi_output, self.fb_num_neighbors,
+        ).reshape(
+            batch_size, num_freqs, self.fb_num_neighbors * 2 + 1, num_frames,
+        )
+
+        noisy_mag_unfolded = subband_unfold_plus(
+            fb_input.reshape(batch_size, 1, num_freqs, num_frames),
+            self.sb_num_neighbors,
+        ).reshape(
+            batch_size, num_freqs, self.sb_num_neighbors * 2 + 1, num_frames,
+        )
+
+        # ====================================================
+        # CONCAT + NORM
+        # ====================================================
+
+        sb_input = torch.cat(
+            [
+                noisy_mag_unfolded,
+                fb_output_unfolded,
+                fbr_output_unfolded,
+                fbi_output_unfolded,
+            ],
+            dim=2,
+        )
+
+        sb_input = self.norm(sb_input)
+
+        # ====================================================
+        # DROP BAND (chỉ áp dụng khi batch_size > 1)
+        # ====================================================
+
+        if batch_size > 1:
+
+            sb_input = subband_drop_band_plus(
+                sb_input.permute(0, 2, 1, 3),
+                num_groups=self.num_groups_in_drop_band,
+            )
+
+            num_freqs = sb_input.shape[2]
+
+            sb_input = sb_input.permute(0, 2, 1, 3)
+
+        # ====================================================
+        # SUB-BAND MODEL
+        # ====================================================
+
+        sb_input = sb_input.reshape(
+            batch_size * num_freqs,
+            (
+                (self.sb_num_neighbors * 2 + 1)
+                + 3 * (self.fb_num_neighbors * 2 + 1)
+            ),
+            num_frames,
+        )
+
+        sb_mask = self.sb_model(sb_input)
+
+        sb_mask = sb_mask.reshape(
+            batch_size, num_freqs, self.output_size, num_frames,
+        ).permute(0, 2, 1, 3).contiguous()
+
+        return sb_mask[:, :, :, self.look_ahead:]
+
+
+# ============================================================
+# FULLSUBNET+ WAVEFORM WRAPPER
+# ============================================================
+
+class FullSubNetPlusWrapper(FullSubNetPlusCore):
+
+    def __init__(
+        self,
+        n_fft,
+        hop_length,
+        win_length,
+        **fsn_kwargs,
+    ):
+
+        super().__init__(**fsn_kwargs)
+
+        self.n_fft = n_fft
+
+        self.hop_length = hop_length
+
+        self.win_length = win_length
+
+    def forward(self, noisy_waveform):
+
+        length = noisy_waveform.shape[-1]
+
+        # ====================================================
+        # STFT
+        # ====================================================
+
+        spec = stft(
+            noisy_waveform,
+            self.n_fft,
+            self.hop_length,
+            self.win_length,
+        )
+
+        mag = torch.abs(spec).unsqueeze(1)
+
+        real = spec.real.unsqueeze(1)
+
+        imag = spec.imag.unsqueeze(1)
+
+        # ====================================================
+        # FULLSUBNET+
+        # ====================================================
+
+        compressed_cirm = super().forward(mag, real, imag)
+
+        # ====================================================
+        # DECOMPRESS cIRM
+        # ====================================================
+
+        cirm = decompress_cIRM(
+            compressed_cirm.permute(0, 2, 3, 1)
+        )
+
+        cirm = cirm.permute(0, 3, 1, 2)
+
+        mask_real = cirm[:, 0]
+
+        mask_imag = cirm[:, 1]
+
+        noisy_real = spec.real
+
+        noisy_imag = spec.imag
+
+        # ====================================================
+        # COMPLEX MULTIPLICATION
+        # ====================================================
+
+        enhanced_real = (
+            noisy_real * mask_real
+            - noisy_imag * mask_imag
+        )
+
+        enhanced_imag = (
+            noisy_real * mask_imag
+            + noisy_imag * mask_real
+        )
+
+        enhanced_spec = torch.complex(enhanced_real, enhanced_imag)
+
+        # ====================================================
+        # ISTFT
+        # ====================================================
+
+        enhanced_wav = istft(
+            enhanced_spec,
+            self.n_fft,
+            self.hop_length,
+            self.win_length,
+            length=length,
+        )
+
+        return enhanced_wav
+
+
+class SubbandInteraction(nn.Module):
 
     def __init__(self, input_size, hidden_size):
         super().__init__()
@@ -788,13 +1656,7 @@ class SubbandInteraction(nn.Module):
 
 
 class SubInterLSTMBlock(nn.Module):
-    """
-    Một "SIL block" (SubInter-LSTM block): SubInter -> RNN -> norm.
 
-    RNN chạy độc lập theo thời gian cho từng (batch, frequency),
-    nhưng chia sẻ trọng số giữa các tần số, nên cần gộp (B, F)
-    thành một chiều batch duy nhất khi đưa vào RNN.
-    """
 
     def __init__(
         self,
@@ -848,14 +1710,6 @@ class SubInterLSTMBlock(nn.Module):
 
 
 class InterSubbandModel(nn.Module):
-    """
-    Toàn bộ "Gis" trong bài báo Inter-SubNet: nhiều SIL block
-    xếp chồng, theo sau là một fully-connected layer để ra cIRM.
-
-    Checkpoint hiện tại có đúng 2 SIL block với hidden size
-    lần lượt là 93 và 307 (khớp tinh thần bài báo, tuy giá trị
-    cụ thể phụ thuộc vào cấu hình huấn luyện).
-    """
 
     def __init__(
         self,
@@ -968,9 +1822,6 @@ class InterSubNetCore(nn.Module):
         # ====================================================
         # WEIGHT INIT
         # ====================================================
-        #
-        # QUAN TRỌNG: không gọi khi load checkpoint (weight_init=False),
-        # chỉ dùng khi train from scratch.
 
         if weight_init:
             generic_weight_init(self)
@@ -1587,6 +2438,12 @@ def build_model(cfg: dict) -> nn.Module:
     if name == "FullSubNet":
         model_cfg = model_cfg["FullSubNet"]
 
+    elif name == "FullSubNetPlus" or name == "FullSubNet+":
+        model_cfg = model_cfg.get(
+            "FullSubNet+",
+            model_cfg.get("FullSubNetPlus"),
+        )
+
     elif name == "InterSubNet":
         model_cfg = model_cfg["InterSubNet"]
 
@@ -1679,21 +2536,87 @@ def build_model(cfg: dict) -> nn.Module:
         )
 
     # ========================================================
+    # FULLSUBNET+
+    # ========================================================
+
+    elif name == "FullSubNetPlus" or name == "FullSubNet+":
+
+        return FullSubNetPlusWrapper(
+
+            n_fft=stft_cfg["n_fft"],
+
+            hop_length=stft_cfg["hop_length"],
+
+            win_length=stft_cfg["win_length"],
+
+            num_freqs=model_cfg["num_freqs"],
+
+            look_ahead=model_cfg["look_ahead"],
+
+            sequence_model=model_cfg["sequence_model"],
+
+            fb_num_neighbors=model_cfg["fb_num_neighbors"],
+
+            sb_num_neighbors=model_cfg["sb_num_neighbors"],
+
+            fb_output_activate_function=(
+                model_cfg["fb_output_activate_function"]
+            ),
+
+            sb_output_activate_function=(
+                model_cfg["sb_output_activate_function"]
+            ),
+
+            fb_model_hidden_size=(
+                model_cfg["fb_model_hidden_size"]
+            ),
+
+            sb_model_hidden_size=(
+                model_cfg["sb_model_hidden_size"]
+            ),
+
+            norm_type=model_cfg.get(
+                "norm_type",
+                "offline_laplace_norm",
+            ),
+
+            num_groups_in_drop_band=(
+                model_cfg.get(
+                    "num_groups_in_drop_band",
+                    2,
+                )
+            ),
+
+            channel_attention_model=model_cfg.get(
+                "channel_attention_model",
+                "TSSE",
+            ),
+
+            output_size=model_cfg.get(
+                "output_size",
+                2,
+            ),
+
+            subband_num=model_cfg.get(
+                "subband_num",
+                1,
+            ),
+
+            kersize=tuple(
+                model_cfg.get(
+                    "kersize",
+                    (3, 5, 10),
+                )
+            ),
+
+            weight_init=False,
+        )
+    
+    # ========================================================
     # INTERSUBNET
     # ========================================================
 
     elif name == "InterSubNet":
-
-        # InterSubNet KHÔNG có nhánh full-band (fb_model), nên
-        # không cần / không dùng các tham số fb_num_neighbors,
-        # fb_model_hidden_size, fb_output_activate_function.
-        #
-        # sil_hidden_sizes: kích thước hidden của từng khối
-        # SubInter (SIL block), mặc định (93, 307) khớp với
-        # checkpoint tham chiếu (InTerSubNet_EN.tar). Nếu bạn có
-        # checkpoint khác với số lượng/khác kích thước SIL block,
-        # hãy khai báo "sil_hidden_sizes" trong model_cfg.
-
         return InterSubNetWrapper(
 
             n_fft=stft_cfg["n_fft"],

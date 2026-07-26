@@ -67,13 +67,25 @@ def save_checkpoint(path: str, model, optimizer, epoch: int, best_val: float, cf
     )
 
 
-def load_checkpoint(checkpoint_path, model, map_location="cpu"):
-    ckpt = torch.load(
-        checkpoint_path,
-        map_location=map_location,
-        weights_only=False
-    )
+def load_checkpoint(checkpoint_path, model, map_location=None):
+    ckpt = torch.load(checkpoint_path, map_location=map_location)
+    
+    if isinstance(ckpt, dict):
+        if "model" in ckpt:
+            state_dict = ckpt["model"]
+        elif "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+        elif "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        else:
+            state_dict = ckpt
+    else:
+        state_dict = ckpt
 
-    model.load_state_dict(ckpt["model"])
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace("module.", "").replace("model.", "") if k.startswith("module.") or k.startswith("model.") else k
+        new_state_dict[name] = v
 
-    return ckpt
+    model.load_state_dict(new_state_dict, strict=False)
+    print(f"Successfully loaded checkpoint from {checkpoint_path}")

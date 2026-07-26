@@ -588,7 +588,6 @@ class FullSubNetCore(nn.Module):
             self.look_ahead:,
         ]
 
-
 # ============================================================
 # FULLSUBNET WAVEFORM WRAPPER
 # ============================================================
@@ -724,27 +723,9 @@ class FullSubNetWrapper(
         return enhanced_wav
 
 
-
 # ============================================================
 # FULLSUBNET+ — CÁC MODULE PHỤ TRỢ
 # ============================================================
-#
-# Phần dưới đây triển khai lại đúng kiến trúc gốc của FullSubNet+
-# ("FullSubNet+: Channel Attention FullSubNet with Complex
-# Spectrograms for Speech Enhancement", Chen et al., ICASSP 2022,
-# repo: RookieJunChen/FullSubNet-plus), để tương thích với checkpoint
-# .tar được huấn luyện từ repo gốc.
-#
-# Khác với FullSubNet:
-#   - Dùng 3 full-band model riêng biệt (magnitude, real, imaginary),
-#     mỗi cái là 1 chuỗi 8 khối TCN (Temporal Convolutional Network)
-#     thay vì LSTM/GRU.
-#   - Mỗi luồng có 1 lớp channel attention riêng (mặc định: MulCA /
-#     "TSSE" - Time-Sense Squeeze-and-Excitation) áp dụng theo chiều
-#     tần số trước khi đưa vào full-band model.
-#   - Sub-band model nhận input là nối 4 phần: noisy mag neighbor +
-#     3 full-band output neighbor (mag/real/imag).
-
 
 # ------------------------------------------------------------
 # CHANNEL ATTENTION LAYERS (theo attention_model.py gốc)
@@ -1115,11 +1096,6 @@ class TCNSequenceModel(nn.Module):
 # ------------------------------------------------------------
 # NORMALIZE / UNFOLD / DROP-BAND RIÊNG CHO FULLSUBNET+
 # ------------------------------------------------------------
-#
-# Lưu ý: KHÔNG dùng chung freq_unfold / drop_band / OfflineLaplaceNorm
-# đã định nghĩa cho FullSubNet gốc ở trên, vì công thức chi tiết
-# (padding "reflect" thay vì "replicate", norm không lấy trị tuyệt
-# đối, ...) khác nhau, cần khớp chính xác với checkpoint đã train.
 
 class OfflineLaplaceNormPlus(nn.Module):
     """
@@ -2002,6 +1978,231 @@ class InterSubNetWrapper(InterSubNetCore):
 
         return enhanced_wav
 
+# ============================================================
+# CONV-TASNET HELPER MODULES
+# ============================================================
+
+class ChannelWiseLayerNorm(nn.LayerNorm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x):
+        if x.dim() != 3:
+            raise RuntimeError(f"{self.__class__.__name__} accepts 3D tensor as input")
+        x = torch.transpose(x, 1, 2)
+        x = super().forward(x)
+        x = torch.transpose(x, 1, 2)
+        return x
+
+
+class GlobalChannelLayerNorm(nn.Module):
+    def __init__(self, dim, eps=1e-05, elementwise_affine=True):
+        super().__init__()
+        self.eps = eps
+        self.normalized_dim = dim
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.beta = nn.Parameter(torch.zeros(dim, 1))
+            self.gamma = nn.Parameter(torch.ones(dim, 1))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        if x.dim() != 3:
+            raise RuntimeError(f"{self.__class__.__name__} accepts 3D tensor as input")
+        mean = torch.mean(x, (1, 2), keepdim=True)
+        var = torch.mean((x - mean)**2, (1, 2), keepdim=True)
+        if self.elementwise_affine:
+            x = self.gamma * (x - mean) / torch.sqrt(var + self.eps) + self.beta
+        else:
+            x = (x - mean) / torch.sqrt(var + self.eps)
+        return x
+
+
+def select_norm(norm, dim):
+    if norm not in ["cLN", "gLN", "BN"]:
+        raise RuntimeError(f"Unsupported normalize layer: {norm}")
+    if norm == "cLN":
+        return ChannelWiseLayerNorm(dim, elementwise_affine=True)
+    elif norm == "BN":
+        return nn.BatchNorm1d(dim)
+    else:
+        return GlobalChannelLayerNorm(dim, elementwise_affine=True)
+
+
+class Conv1D_Block(nn.Module):
+    def __init__(self, in_channels=128, out_channels=512, kernel_size=3, dilation=1, norm_type='gLN'):
+        super().__init__()
+        self.conv1x1 = nn.Conv1d(in_channels, out_channels, 1)
+        self.prelu1 = nn.PReLU()
+        self.norm1 = select_norm(norm_type, out_channels)
+        if norm_type == 'gLN':
+            self.padding = (dilation * (kernel_size - 1)) // 2
+        else:
+            self.padding = dilation * (kernel_size - 1)
+        self.dwconv = nn.Conv1d(out_channels, out_channels, kernel_size, 1, dilation=dilation, padding=self.padding, groups=out_channels, bias=True)
+        self.prelu2 = nn.PReLU()
+        self.norm2 = select_norm(norm_type, out_channels)
+        self.sconv = nn.Conv1d(out_channels, in_channels, 1, bias=True)
+        self.norm_type = norm_type
+
+    def forward(self, x):
+        w = self.conv1x1(x)
+        w = self.norm1(self.prelu1(w))
+        w = self.dwconv(w)
+        if self.norm_type == 'cLN':
+            w = w[:, :, :-self.padding]
+        w = self.norm2(self.prelu2(w))
+        w = self.sconv(w)
+        x = x + w
+        return x
+
+
+class TCN(nn.Module):
+    def __init__(self, in_channels=128, out_channels=512, kernel_size=3, norm_type='gLN', X=8):
+        super().__init__()
+        seq = [Conv1D_Block(in_channels, out_channels, kernel_size, 2**i, norm_type) for i in range(X)]
+        self.tcn = nn.Sequential(*seq)
+
+    def forward(self, x):
+        return self.tcn(x)
+
+
+class Separation(nn.Module):
+    def __init__(self, in_channels=128, out_channels=512, kernel_size=3, norm_type='gLN', X=8, R=3):
+        super().__init__()
+        s = [TCN(in_channels, out_channels, kernel_size, norm_type, X) for _ in range(R)]
+        self.sep = nn.Sequential(*s)
+
+    def forward(self, x):
+        return self.sep(x)
+
+
+class Encoder(nn.Module):
+    def __init__(self, in_channels=1, out_channels=512, bottleneck=128, kernel_size=16, norm_type='gLN'):
+        super().__init__()
+        self.encoder = nn.Conv1d(in_channels, out_channels, kernel_size, kernel_size // 2, padding=0)
+        self.norm = select_norm(norm_type, out_channels)
+        self.conv1x1 = nn.Conv1d(out_channels, bottleneck, 1)
+
+    def forward(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        x = self.encoder(x)
+        w = self.norm(x)
+        w = self.conv1x1(w)
+        return x, w
+
+
+class Decoder(nn.Module):
+    def __init__(self, in_channels=512, out_channels=1, kernel_size=16):
+        super().__init__()
+        self.decoder = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, kernel_size // 2, padding=0, bias=True)
+
+    def forward(self, x):
+        x = self.decoder(x)
+        return x.squeeze(1) if x.dim() == 3 and x.size(1) == 1 else x.squeeze()
+
+# ============================================================
+# CONV-TASNET CORE
+# ============================================================
+
+class ConvTasNetCore(nn.Module):
+    """
+    Conv-TasNet hoạt động trực tiếp trên Time-Domain (Waveform),
+    không qua bước biến đổi STFT (Encoder1D -> Separation -> Decoder1D).
+    """
+
+    def __init__(
+        self,
+        N=512,
+        L=16,
+        B=128,
+        H=512,
+        P=3,
+        X=8,
+        R=3,
+        norm="gLN",
+        num_spks=1,
+        activate="relu",
+        causal=False,
+    ):
+        super().__init__()
+
+        self.num_spks = num_spks
+
+        # ----------------------------------------------------
+        # ENCODER / SEPARATION / DECODER
+        # ----------------------------------------------------
+        self.encoder = Encoder(1, N, B, L, norm)
+        self.separation = Separation(B, H, P, norm, X, R)
+        self.decoder = Decoder(H, 1, L)
+        self.mask = nn.Conv1d(B, H * num_spks, 1, 1)
+
+        supported_nonlinear = {
+            "relu": F.relu,
+            "sigmoid": torch.sigmoid,
+            "softmax": lambda x: F.softmax(x, dim=0),
+        }
+        if activate not in supported_nonlinear:
+            raise RuntimeError(f"Unsupported non-linear function: {activate}")
+
+        self.non_linear = supported_nonlinear[activate]
+
+    def forward(self, noisy_y):
+        """
+        Input:
+            noisy_y: (B, T) hoặc (B, 1, T) - Waveform thời gian
+        Output:
+            enhanced_y: (B, T) - Waveform sau khi triệt nhiễu
+        """
+        if noisy_y.dim() == 1:
+            noisy_y = noisy_y.unsqueeze(0)
+
+        x, w = self.encoder(noisy_y)
+        w = self.separation(w)
+        m = self.mask(w)
+        m = torch.chunk(m, chunks=self.num_spks, dim=1)
+        m = self.non_linear(torch.stack(m, dim=0))
+
+        d = [x * m[i] for i in range(self.num_spks)]
+        s = [self.decoder(d[i]) for i in range(self.num_spks)]
+
+        # Lấy nguồn tín hiệu đầu ra duy nhất (Single-speaker speech enhancement)
+        enhanced_y = s[0]
+
+        # Đảm bảo shape đầu ra là (B, T) khớp với chiều dài input
+        if enhanced_y.shape[-1] > noisy_y.shape[-1]:
+            enhanced_y = enhanced_y[..., : noisy_y.shape[-1]]
+        elif enhanced_y.shape[-1] < noisy_y.shape[-1]:
+            enhanced_y = F.pad(enhanced_y, (0, noisy_y.shape[-1] - enhanced_y.shape[-1]))
+
+        return enhanced_y
+
+# ============================================================
+# CONV-TASNET WAVEFORM WRAPPER
+# ============================================================
+
+class ConvTasNetWrapper(ConvTasNetCore):
+    """
+    Wrapper đồng bộ với định dạng chung trong dự án (nhận n_fft, hop_length,...
+    nhưng Conv-TasNet xử lý trực tiếp tín hiệu dạng sóng Waveform).
+    """
+
+    def __init__(
+        self,
+        n_fft=None,
+        hop_length=None,
+        win_length=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+    def forward(self, noisy_y):
+        return super().forward(noisy_y)
 
 # ============================================================
 # CRN
@@ -2447,6 +2648,9 @@ def build_model(cfg: dict) -> nn.Module:
     elif name == "InterSubNet":
         model_cfg = model_cfg["InterSubNet"]
 
+    elif name == "Conv-TasNet":
+        model_cfg = model_cfg["Conv-TasNet"]
+
     elif name == "CRN":
         model_cfg = model_cfg
 
@@ -2661,6 +2865,37 @@ def build_model(cfg: dict) -> nn.Module:
             ),
 
             weight_init=False,
+        )
+
+    # ========================================================
+    # CONV-TASNET
+    # ========================================================
+
+    elif name in ["ConvTasNet", "Conv-TasNet"]:
+
+        return ConvTasNetWrapper(
+
+            N=model_cfg.get("N", 512),
+
+            L=model_cfg.get("L", 16),
+
+            B=model_cfg.get("B", 128),
+
+            H=model_cfg.get("H", 512),
+
+            P=model_cfg.get("P", 3),
+
+            X=model_cfg.get("X", 8),
+
+            R=model_cfg.get("R", 3),
+
+            norm=model_cfg.get("norm_type", "gLN"),
+
+            num_spks=model_cfg.get("num_spks", 1),
+
+            activate=model_cfg.get("activate", "relu"),
+
+            causal=model_cfg.get("causal", False),
         )
 
     # ========================================================

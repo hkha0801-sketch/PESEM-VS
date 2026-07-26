@@ -11,7 +11,7 @@ stft:
 
 
 model:
-  name: "FullSubNet+"
+  name: "Conv-TasNet"
 
   FullSubNet:
     num_freqs: 257
@@ -55,6 +55,18 @@ model:
     num_groups_in_drop_band: 2
     weight_init: false
 
+  Conv-TasNet:
+    N: 512        
+    L: 16          
+    B: 128     
+    H: 512         
+    P: 3        
+    X: 8        
+    R: 3           
+    norm_type: "gLN" 
+    mask_act: "relu" 
+
+  
 
 train:
   batch_size: 8
@@ -82,6 +94,9 @@ infer:
 
   InterSubNet:
     checkpoint: "checkpoints/InterSubNet_EN.tar"
+
+  Conv-TasNet:
+    checkpoint: "checkpoints/Conv-TasNet_EN.pt"
 
   input: null
   output: null

@@ -2205,6 +2205,608 @@ class ConvTasNetWrapper(ConvTasNetCore):
         return super().forward(noisy_y)
 
 # ============================================================
+# METRICGAN+ 
+# ============================================================
+
+class MetricGANPlusGenerator(nn.Module):
+    """
+    MetricGAN+ Generator
+
+    Input:
+        x: (B, T, 257)
+
+    Output:
+        mask: (B, T, 257)
+    """
+
+    def __init__(
+        self,
+        num_freqs=257,
+        hidden_size=200,
+        num_layers=2,
+        dropout=0.1,
+        causal=False,
+    ):
+        super().__init__()
+
+        self.num_freqs = num_freqs
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.causal = causal
+
+        # ------------------------------------------------
+        # LSTM
+        # ------------------------------------------------
+
+        self.lstm = nn.LSTM(
+            input_size=num_freqs,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=not causal,
+            batch_first=True,
+        )
+
+        # ------------------------------------------------
+        # LSTM Initialization
+        # ------------------------------------------------
+
+        for name, param in self.lstm.named_parameters():
+
+            if "bias" in name:
+                nn.init.zeros_(param)
+
+            elif "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+
+        # ------------------------------------------------
+        # LSTM output dimension
+        # ------------------------------------------------
+
+        lstm_dim = (
+            hidden_size * 2
+            if not causal
+            else hidden_size
+        )
+
+        # ------------------------------------------------
+        # Fully Connected
+        # ------------------------------------------------
+
+        self.fc1 = nn.Linear(
+            lstm_dim,
+            300
+        )
+
+        self.fc2 = nn.Linear(
+            300,
+            num_freqs
+        )
+
+        # ------------------------------------------------
+        # Xavier Initialization
+        # ------------------------------------------------
+
+        nn.init.xavier_uniform_(
+            self.fc1.weight
+        )
+
+        nn.init.zeros_(
+            self.fc1.bias
+        )
+
+        nn.init.xavier_uniform_(
+            self.fc2.weight
+        )
+
+        nn.init.zeros_(
+            self.fc2.bias
+        )
+
+        # ------------------------------------------------
+        # Activation
+        # ------------------------------------------------
+
+        self.LReLU = nn.LeakyReLU(
+            negative_slope=0.3
+        )
+
+        # ------------------------------------------------
+        # Learnable Sigmoid
+        # ------------------------------------------------
+
+        self.Learnable_sigmoid = (
+            LearnableSigmoid(
+                in_features=num_freqs
+            )
+        )
+
+    def forward(
+        self,
+        x,
+        lengths=None
+    ):
+
+        # x:
+        # (B, T, F)
+
+        # ------------------------------------------------
+        # Pack sequence
+        # ------------------------------------------------
+
+        if lengths is not None:
+
+            lengths = lengths.cpu()
+
+            x = nn.utils.rnn.pack_padded_sequence(
+                x,
+                lengths,
+                batch_first=True,
+                enforce_sorted=False,
+            )
+
+        # ------------------------------------------------
+        # LSTM
+        # ------------------------------------------------
+
+        outputs, _ = self.lstm(
+            x
+        )
+
+        # ------------------------------------------------
+        # Unpack sequence
+        # ------------------------------------------------
+
+        if lengths is not None:
+
+            outputs, _ = (
+                nn.utils.rnn.pad_packed_sequence(
+                    outputs,
+                    batch_first=True,
+                )
+            )
+
+        # ------------------------------------------------
+        # FC1
+        # ------------------------------------------------
+
+        outputs = self.fc1(
+            outputs
+        )
+
+        outputs = self.LReLU(
+            outputs
+        )
+
+        # ------------------------------------------------
+        # FC2
+        # ------------------------------------------------
+
+        outputs = self.fc2(
+            outputs
+        )
+
+        # ------------------------------------------------
+        # Learnable Sigmoid
+        # ------------------------------------------------
+
+        outputs = (
+            self.Learnable_sigmoid(
+                outputs
+            )
+        )
+
+        return outputs
+
+
+class LearnableSigmoid(nn.Module):
+    """
+    Learnable Sigmoid used in MetricGAN+ Generator.
+    """
+
+    def __init__(
+        self,
+        in_features=257
+    ):
+        super().__init__()
+
+        self.slope = nn.Parameter(
+            torch.ones(
+                in_features
+            )
+        )
+
+    def forward(
+        self,
+        x
+    ):
+
+        return (
+            1.2
+            * torch.sigmoid(
+                self.slope * x
+            )
+        )
+
+
+class MetricGANPlusDiscriminator(
+    nn.Module
+):
+    """
+    MetricGAN+ Discriminator
+
+    Input:
+        x: (B, 2, T, F)
+
+    Output:
+        metric score:
+        (B, num_target_metrics)
+    """
+
+    def __init__(
+        self,
+        num_target_metrics=1
+    ):
+        super().__init__()
+
+        # ------------------------------------------------
+        # Batch Normalization
+        # ------------------------------------------------
+
+        self.BN = nn.BatchNorm2d(
+            num_features=2,
+            momentum=0.01
+        )
+
+        # ------------------------------------------------
+        # CNN
+        # ------------------------------------------------
+
+        base_channel = 16
+
+        layers = []
+
+        layers.append(
+            nn.Conv2d(
+                2,
+                base_channel,
+                kernel_size=(5, 5)
+            )
+        )
+
+        layers.append(
+            nn.Conv2d(
+                base_channel,
+                base_channel * 2,
+                kernel_size=(5, 5)
+            )
+        )
+
+        layers.append(
+            nn.Conv2d(
+                base_channel * 2,
+                base_channel * 4,
+                kernel_size=(5, 5)
+            )
+        )
+
+        layers.append(
+            nn.Conv2d(
+                base_channel * 4,
+                base_channel * 8,
+                kernel_size=(5, 5)
+            )
+        )
+
+        self.layers = nn.ModuleList(
+            layers
+        )
+
+        # ------------------------------------------------
+        # Initialize CNN
+        # ------------------------------------------------
+
+        for layer in self.layers:
+
+            nn.init.xavier_uniform_(
+                layer.weight
+            )
+
+            nn.init.zeros_(
+                layer.bias
+            )
+
+        # ------------------------------------------------
+        # Activation
+        # ------------------------------------------------
+
+        self.LReLU = nn.LeakyReLU(
+            negative_slope=0.3
+        )
+
+        # ------------------------------------------------
+        # Fully Connected
+        # ------------------------------------------------
+
+        self.fc1 = nn.Linear(
+            base_channel * 8,
+            50
+        )
+
+        self.fc2 = nn.Linear(
+            50,
+            10
+        )
+
+        self.fc3 = nn.Linear(
+            10,
+            num_target_metrics
+        )
+
+        # ------------------------------------------------
+        # Initialize FC
+        # ------------------------------------------------
+
+        for layer in [
+            self.fc1,
+            self.fc2,
+            self.fc3
+        ]:
+
+            nn.init.xavier_uniform_(
+                layer.weight
+            )
+
+            nn.init.zeros_(
+                layer.bias
+            )
+
+    def forward(
+        self,
+        x
+    ):
+
+        # ------------------------------------------------
+        # BatchNorm
+        # ------------------------------------------------
+
+        x = self.BN(
+            x
+        )
+
+        # ------------------------------------------------
+        # CNN
+        # ------------------------------------------------
+
+        for layer in self.layers:
+
+            x = layer(
+                x
+            )
+
+            x = self.LReLU(
+                x
+            )
+
+        # ------------------------------------------------
+        # Global Average Pooling
+        # ------------------------------------------------
+
+        x = torch.mean(
+            x,
+            dim=(2, 3)
+        )
+
+        # ------------------------------------------------
+        # Fully Connected
+        # ------------------------------------------------
+
+        x = self.fc1(
+            x
+        )
+
+        x = self.LReLU(
+            x
+        )
+
+        x = self.fc2(
+            x
+        )
+
+        x = self.LReLU(
+            x
+        )
+
+        x = self.fc3(
+            x
+        )
+
+        return x
+
+# ============================================================
+# METRICGAN+ WAVEFORM WRAPPER
+# ============================================================
+
+class MetricGANPlusWrapper(
+    nn.Module
+):
+
+    def __init__(
+        self,
+        n_fft=512,
+        hop_length=128,
+        win_length=512,
+        num_freqs=257,
+        hidden_size=200,
+        num_layers=2,
+        dropout=0.1,
+        causal=False,
+    ):
+        super().__init__()
+
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.num_freqs = num_freqs
+
+        # ------------------------------------------------
+        # Generator
+        # ------------------------------------------------
+
+        self.generator = (
+            MetricGANPlusGenerator(
+                num_freqs=num_freqs,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout,
+                causal=causal,
+            )
+        )
+
+        # ------------------------------------------------
+        # STFT Window
+        # ------------------------------------------------
+
+        self.register_buffer(
+            "window",
+            torch.hann_window(
+                win_length
+            )
+        )
+
+    def forward(
+        self,
+        wav
+    ):
+
+        # ------------------------------------------------
+        # Input
+        #
+        # (B, 1, T)
+        # hoặc
+        # (B, T)
+        # ------------------------------------------------
+
+        if wav.dim() == 3:
+            wav = wav.squeeze(1)
+
+        # ------------------------------------------------
+        # STFT
+        # ------------------------------------------------
+
+        spec = torch.stft(
+            wav,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window.to(
+                wav.device
+            ),
+            return_complex=True,
+        )
+
+        # ------------------------------------------------
+        # Magnitude
+        # ------------------------------------------------
+
+        magnitude = torch.abs(
+            spec
+        )
+
+        # ------------------------------------------------
+        # Phase
+        # ------------------------------------------------
+
+        phase = torch.angle(
+            spec
+        )
+
+        # ------------------------------------------------
+        # (B, F, T)
+        #
+        # ->
+        #
+        # (B, T, F)
+        # ------------------------------------------------
+
+        generator_input = (
+            magnitude.transpose(
+                1,
+                2
+            )
+        )
+
+        # ------------------------------------------------
+        # Generate mask
+        # ------------------------------------------------
+
+        mask = self.generator(
+            generator_input
+        )
+
+        # ------------------------------------------------
+        # (B, T, F)
+        #
+        # ->
+        #
+        # (B, F, T)
+        # ------------------------------------------------
+
+        mask = mask.transpose(
+            1,
+            2
+        )
+
+        # ------------------------------------------------
+        # Apply mask
+        # ------------------------------------------------
+
+        enhanced_magnitude = (
+            magnitude
+            * mask
+        )
+
+        # ------------------------------------------------
+        # Reconstruct complex STFT
+        # ------------------------------------------------
+
+        enhanced_spec = (
+            enhanced_magnitude
+            * torch.exp(
+                1j * phase
+            )
+        )
+
+        # ------------------------------------------------
+        # ISTFT
+        # ------------------------------------------------
+
+        enhanced_wav = torch.istft(
+            enhanced_spec,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window.to(
+                wav.device
+            ),
+            length=wav.shape[-1],
+        )
+
+        # ------------------------------------------------
+        # Return
+        #
+        # (B, 1, T)
+        # ------------------------------------------------
+
+        return enhanced_wav.unsqueeze(
+            1
+        )
+
+
+# ============================================================
 # CRN
 # ============================================================
 
@@ -2651,6 +3253,12 @@ def build_model(cfg: dict) -> nn.Module:
     elif name == "Conv-TasNet":
         model_cfg = model_cfg["Conv-TasNet"]
 
+    elif name == "MetricGAN+" or name == "MetricGANPlus":
+        model_cfg = model_cfg.get(
+            "MetricGAN+",
+            model_cfg.get("MetricGANPlus"),
+        )
+
     elif name == "CRN":
         model_cfg = model_cfg
 
@@ -2896,6 +3504,68 @@ def build_model(cfg: dict) -> nn.Module:
             activate=model_cfg.get("activate", "relu"),
 
             causal=model_cfg.get("causal", False),
+        )
+
+    # ========================================================
+    # METRICGAN+
+    # ========================================================
+
+    elif name in ["MetricGAN+", "MetricGANPlus"]:
+        return MetricGANPlusWrapper(
+            n_fft=stft_cfg["n_fft"],
+            hop_length=stft_cfg["hop_length"],
+            win_length=stft_cfg["win_length"],
+            num_freqs=model_cfg.get("num_freqs", 257),
+            hidden_size=model_cfg.get("hidden_size", 200),
+            num_layers=model_cfg.get("num_layers", 2),
+            dropout=model_cfg.get("dropout", 0.0),
+            causal=model_cfg.get("causal", False),
+        )
+        
+        return MetricGANPlusWrapper(
+
+            n_fft=stft_cfg["n_fft"],
+
+            hop_length=stft_cfg["hop_length"],
+
+            win_length=stft_cfg["win_length"],
+
+            num_freqs=model_cfg["num_freqs"],
+
+            look_ahead=model_cfg["look_ahead"],
+
+            sequence_model=model_cfg["sequence_model"],
+
+            sb_num_neighbors=model_cfg["sb_num_neighbors"],
+
+            sb_output_activate_function=(
+                model_cfg["sb_output_activate_function"]
+            ),
+
+            sb_model_hidden_size=(
+                model_cfg["sb_model_hidden_size"]
+            ),
+
+            sil_hidden_sizes=tuple(
+                model_cfg.get(
+                    "sil_hidden_sizes",
+                    (93, 307),
+                )
+            ),
+
+            norm_type=model_cfg.get(
+                "norm_type",
+                "offline_laplace_norm",
+            ),
+
+            num_groups_in_drop_band=(
+                model_cfg.get(
+                    "num_groups_in_drop_band",
+                    2,
+                )
+            ),
+
+            weight_init=False,
         )
 
     # ========================================================

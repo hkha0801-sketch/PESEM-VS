@@ -24,10 +24,17 @@ def load_audio(path: str, sample_rate: int) -> torch.Tensor:
 
 
 def save_audio(path: str, wav: torch.Tensor, sample_rate: int):
-    """wav: (1, T) or (T,) tensor"""
-    wav_np = wav.squeeze(0).numpy() if wav.dim() == 2 else wav.numpy()
-    sf.write(path, wav_np, sample_rate)
-
+    wav = wav.detach().cpu()
+    wav = wav.squeeze()
+    if wav.dim() != 1:
+        raise ValueError(
+            f"Audio output không hợp lệ, shape = {wav.shape}"
+        )
+    sf.write(
+        path,
+        wav.numpy(),
+        sample_rate
+    )
 
 def enhance_file(model, path: str, sample_rate: int, device) -> torch.Tensor:
     wav = load_audio(path, sample_rate).to(device)

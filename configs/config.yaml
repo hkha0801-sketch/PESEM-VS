@@ -11,7 +11,7 @@ stft:
 
 
 model:
-  name: "Conv-TasNet"
+  name: "MetricGAN+"
 
   FullSubNet:
     num_freqs: 257
@@ -66,6 +66,13 @@ model:
     norm_type: "gLN" 
     mask_act: "relu" 
 
+  MetricGAN+:
+    num_freqs: 257
+    hidden_size: 200
+    num_layers: 2
+    dropout: 0.1
+    causal: false
+
   
 
 train:
@@ -97,6 +104,9 @@ infer:
 
   Conv-TasNet:
     checkpoint: "checkpoints/Conv-TasNet_EN.pt"
+
+  MetricGAN+:
+    checkpoint: "checkpoints/MetricGAN+_EN.pth"
 
   input: null
   output: null

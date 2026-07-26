@@ -7,7 +7,7 @@ from pystoi import stoi
 
 CLEAN_DIR = "inputTestClean"
 ENHANCED_DIR = "output"
-RESULT_FILE = "Conv-TasNet_EN.txt"
+RESULT_FILE = "MetricGAN+_EN.txt"
 
 
 def calc_volume_diff(clean, enhanced):

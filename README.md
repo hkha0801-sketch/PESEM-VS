@@ -1,8 +1,5 @@
 # PESEM-VS: An F0-RMSE-Driven Empirical Study of Speech Enhancement Models for Vietnamese Speech
 
-[![Dataset](https://img.shields.io/badge/🤗%20Dataset-Hugging%20Face-yellow)](https://huggingface.co/datasets/KhaBui/PESEM-VS)
-[![Paper](https://img.shields.io/badge/Paper-PDF-red)](#)
-
 > Speech enhancement models are overwhelmingly developed and validated on English-centric corpora. **PESEM-VS** is an empirical study that puts ten representative speech enhancement architectures to the test on **Vietnamese**, a tonal language where pitch (F0) contours carry lexical meaning — something standard metrics like PESQ and STOI simply cannot capture.
 
 ---

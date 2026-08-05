@@ -58,16 +58,6 @@ Findings are consistent across regional accents and across AI-generated vs. real
 
 📦 Fine-tuned checkpoints: **[KhaBui/PESEM-VS on Hugging Face](https://huggingface.co/KhaBui/PESEM-VS/tree/main)**
 
-## 🚀 Getting Started
-
-```bash
-git clone https://github.com/hkha0801-sketch/PESEM-VS.git
-cd PESEM-VS
-pip install -r requirements.txt
-
-# Run evaluation on a pretrained model
-python scripts/evaluate.py --model fullsubnet_plus --split test
-```
 
 ## 🙏 Acknowledgements
 

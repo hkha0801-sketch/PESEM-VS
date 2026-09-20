@@ -1,0 +1,26 @@
+# PESEM-VS common dependencies
+# Python 3.10+ recommended
+
+# Core scientific stack
+numpy>=1.24,<3.0
+scipy>=1.10
+pandas>=2.0
+
+# Audio processing / pitch extraction
+librosa>=0.10.2
+soundfile>=0.12.1
+
+# Speech enhancement evaluation metrics
+pesq>=0.0.4
+pystoi>=0.4.1
+
+# Deep learning / audio inference
+torch>=2.1
+torchaudio>=2.1
+
+# Utilities
+PyYAML>=6.0
+tqdm>=4.66
+
+# Result visualization
+matplotlib>=3.7

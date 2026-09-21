@@ -327,7 +327,7 @@ MP-SENet starts from a stronger zero-shot baseline and maintains lower absolute 
 
 Its PESQ continues improving until approximately checkpoint 19, with no comparable plateau observed within the evaluated training horizon.
 
-![Checkpoint trajectory](assets/checkpoint_trajectory.pdf)
+![Checkpoint trajectory](assets/checkpoint_trajectory.png)
 
 ---
 
@@ -500,7 +500,7 @@ assets/checkpoint_trajectory.png
 
 ## Architecture Taxonomy
 
-![Speech enhancement architecture taxonomy](assets/taxonomy.pdf)
+![Speech enhancement architecture taxonomy](assets/taxonomy.png)
 
 The evaluated models span sub-band, lightweight/state-space, attention/conformer, and generative/objective-driven approaches.
 
@@ -508,7 +508,7 @@ The evaluated models span sub-band, lightweight/state-space, attention/conformer
 
 ## Experimental Pipeline
 
-![PESEM-VS experimental pipeline](assets/pipeline.pdf)
+![PESEM-VS experimental pipeline](assets/pipeline.png)
 
 The pipeline consists of dataset preparation, zero-shot inference, Vietnamese fine-tuning, objective evaluation, multi-criteria model comparison, and checkpoint analysis.
 

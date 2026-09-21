@@ -144,27 +144,52 @@ Higher is better.
 
 ### F0-RMSE
 
-To evaluate tonal preservation, fundamental-frequency contours are extracted from both clean and enhanced speech using **pYIN**.
+### F0-RMSE
+
+To evaluate tonal preservation, fundamental-frequency (**F0**) contours are extracted from both clean and enhanced speech using **pYIN**.
 
 F0-RMSE is calculated over frames that are identified as voiced in both signals:
 
-\[
-F0\text{-RMSE}
+```math
+\mathrm{F0\text{-}RMSE}
 =
 \sqrt{
 \frac{1}{N}
 \sum_{i=1}^{N}
 \left(
-F_{0}^{clean}(i)
+F_{0}^{\mathrm{clean}}(i)
 -
-F_{0}^{enh}(i)
+F_{0}^{\mathrm{enh}}(i)
 \right)^2
 }
-\]
+```
 
 where \(N\) is the number of valid voiced frames.
 
 Lower values indicate closer preservation of the reference pitch contour.
+
+---
+
+### Pitch Failure Rate
+
+F0-RMSE only evaluates frames for which pitch can be successfully estimated.
+
+**Pitch Failure Rate (PFR)** complements F0-RMSE by measuring the percentage of reference voiced frames for which the enhanced speech fails to produce a valid corresponding F0 estimate.
+
+```math
+\mathrm{PFR}
+=
+\frac{
+N_{\mathrm{failure}}
+}{
+N_{\mathrm{reference\ voiced}}
+}
+\times 100\%
+```
+
+where \(N_{\mathrm{failure}}\) is the number of reference voiced frames without a valid corresponding F0 estimate in the enhanced signal.
+
+Lower values are better. A PFR of **0%** means that a valid F0 estimate is obtained for every reference voiced frame.
 
 ---
 
@@ -302,7 +327,7 @@ MP-SENet starts from a stronger zero-shot baseline and maintains lower absolute 
 
 Its PESQ continues improving until approximately checkpoint 19, with no comparable plateau observed within the evaluated training horizon.
 
-![Checkpoint trajectory](assets/checkpoint_trajectory.png)
+![Checkpoint trajectory](assets/checkpoint_trajectory.pdf)
 
 ---
 
@@ -475,7 +500,7 @@ assets/checkpoint_trajectory.png
 
 ## Architecture Taxonomy
 
-![Speech enhancement architecture taxonomy](assets/taxonomy.png)
+![Speech enhancement architecture taxonomy](assets/taxonomy.pdf)
 
 The evaluated models span sub-band, lightweight/state-space, attention/conformer, and generative/objective-driven approaches.
 
@@ -483,7 +508,7 @@ The evaluated models span sub-band, lightweight/state-space, attention/conformer
 
 ## Experimental Pipeline
 
-![PESEM-VS experimental pipeline](assets/pipeline.png)
+![PESEM-VS experimental pipeline](assets/pipeline.pdf)
 
 The pipeline consists of dataset preparation, zero-shot inference, Vietnamese fine-tuning, objective evaluation, multi-criteria model comparison, and checkpoint analysis.
 
